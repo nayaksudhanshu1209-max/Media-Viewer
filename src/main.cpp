@@ -61,7 +61,8 @@ static std::string KM[256];          // vk -> action
 
 // ---- user options (edited in the Settings window, stored in %APPDATA%\LiteView\keys.ini) ----
 static int o_autonext = 1, o_remvol = 1, o_vol = 100, o_startfs = 0, o_ontop = 0, o_uisec = 2, o_preload = 1;
-static int o_inv = 0, o_swipe = 300, o_hq = 1, o_smooth = 1, o_deband = 0, o_hwdec = 1, o_subsize = 40;
+static int o_inv = 0, o_swipe = 300, o_hq = 1, o_smooth = 0, o_deband = 0, o_hwdec = 1, o_subsize = 40;
+static int o_ultra = 0, o_icc = 0, o_next = 0;   // ultra = heaviest scaler, icc = colour-managed display, next = gpu-next renderer
 static wchar_t o_slang[16], o_alang[16];
 
 static volatile LONG g_preIdx = -1;
@@ -73,7 +74,11 @@ static bool c_pause, c_eof;                 // pushed by mpv (observed)
 static double s_vol = 100, s_bright, s_zoom, s_px, s_py, s_speed = 1, s_subdelay, s_audiodelay, s_subscale = 1;
 static int s_rot;
 static bool s_mute, s_loop;
-static bool g_viewDirty, g_osdDirty, g_seekDirty, g_inter;
+static bool g_viewDirty, g_osdDirty, g_seekDirty;
+static double g_tView, g_tSeek, g_tOsd, g_tOv;
+static volatile LONG g_mmPending;            // coalesced mouse-move from the hook thread
+static volatile LPARAM g_mmLp;
+static volatile WPARAM g_mmWp;
 static double g_seekTarget;
 static char g_osdBuf[96];
 static DWORD g_lastView, g_lastLoad;
@@ -119,7 +124,16 @@ static void osdLater(const char* fmt, ...) {      // coalesced: only the latest 
     va_list ap; va_start(ap, fmt); vsnprintf(g_osdBuf, sizeof g_osdBuf, fmt, ap); va_end(ap);
     g_osdDirty = true;
 }
-static void kick() { SetTimer(g_mw, 2, 16, 0); }  // starts the ~60 Hz flush timer (stops itself when idle)
+static bool g_timerOn;
+static void kick() { if (!g_timerOn) { SetTimer(g_mw, 2, 16, 0); g_timerOn = true; } }   // fallback flush timer
+static double nowms() {
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return c.QuadPart * 1000.0 / f.QuadPart;
+}
+static void pump();
 static void showUI() { g_ui = GetTickCount() + std::max(1, o_uisec) * 1000; }
 
 // ======================= file list =======================
@@ -159,9 +173,11 @@ static void scan(const std::wstring& file) {         // fills `files`, sets idx 
 
 // ======================= quality / per-mode settings =======================
 static void applyQuality() {
-    // heavy EWA upscaler is swapped for bilinear while you are actively zooming/panning (g_inter), then restored
-    setp("scale", !o_hq ? "spline36" : (g_inter ? "bilinear" : "ewa_lanczossharp"));
-    setp("dscale", o_hq ? "mitchell" : "hermite");           // downscaling in linear light: no dots / moire
+    // Fast: bilinear/hermite.  High (default): spline36 up, mitchell down.  Ultra: ewa_lanczossharp + linear light (heavy).
+    setp("scale", o_ultra ? "ewa_lanczossharp" : (o_hq ? "spline36" : "bilinear"));
+    setp("dscale", (o_ultra || o_hq) ? "mitchell" : "hermite");   // wide kernel when shrinking: no dots / moire
+    setp("linear-downscaling", o_ultra ? "yes" : "no");
+    setp("sigmoid-upscaling", o_ultra ? "yes" : "no");
 }
 static void applyMode(bool vid) {
     if (vid) {
@@ -179,18 +195,14 @@ static void applyRuntime() {
     applyQuality();
     g_mode = -1; applyMode(g_isVid); g_mode = g_isVid ? 1 : 0;
     setp("hwdec", o_hwdec ? "auto-safe" : "no");
+    setp("icc-profile-auto", o_icc ? "yes" : "no");
     setp("ontop", o_ontop ? "yes" : "no");
     char b[16]; snprintf(b, 16, "%d", std::max(10, o_subsize)); setp("sub-font-size", b);
 }
 
 // ======================= view state (zoom / pan / volume ...) =======================
 static void sendView() { setd("video-zoom", s_zoom); setd("video-pan-x", s_px); setd("video-pan-y", s_py); }
-static void viewChanged() {
-    g_viewDirty = true;
-    g_lastView = GetTickCount();
-    if (!g_inter && o_hq) { g_inter = true; setp("scale", "bilinear"); }
-    kick();
-}
+static void viewChanged() { g_viewDirty = true; kick(); }
 static void setVol(double v) { s_vol = std::clamp(v, 0.0, 130.0); setd("volume", s_vol); }
 static void setBright(double v) { s_bright = std::clamp(v, -100.0, 100.0); setd("brightness", s_bright); }
 static void setSpeed(double v) { s_speed = std::clamp(floor(v * 100 + 0.5) / 100, 0.1, 8.0); setd("speed", s_speed); }
@@ -241,17 +253,18 @@ static DWORD WINAPI preloadThread(LPVOID) {
     char* buf = (char*)VirtualAlloc(0, 1 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     std::vector<char> warm;
     LONG gen = -1;
-    static const int order[] = {1, -1, 2, -2};
+    static const int order[] = {1, -1};
     for (;;) {
         WaitForSingleObject(g_preEv, INFINITE);
     again:
+        LONG b0 = g_preIdx; Sleep(450); if (b0 != g_preIdx) goto again;     // let the photo/video show first
         int base = (int)g_preIdx, ids[4], cnt = 0;
         std::wstring paths[4];
         EnterCriticalSection(&g_fl);
         if (gen != g_flGen) { gen = g_flGen; warm.assign(files.size(), 0); }
         int n = (int)files.size();
         if (base >= 0 && base < n && n > 1)
-            for (int k = 0; k < 4; k++) {
+            for (int k = 0; k < 2; k++) {
                 int i = ((base + order[k]) % n + n) % n;
                 if (i == base || warm[i]) continue;
                 paths[cnt] = files[i]; ids[cnt] = i; cnt++;
@@ -362,10 +375,12 @@ static void loadSettings() {
     o_autonext = gi(L"autonext", 1); o_remvol = gi(L"remember_volume", 1); o_vol = gi(L"volume", 100);
     o_startfs = gi(L"start_fullscreen", 0); o_ontop = gi(L"always_on_top", 0); o_uisec = gi(L"controls_hide_seconds", 2);
     o_preload = gi(L"preload", 1); o_inv = gi(L"invert_swipe", 0); o_swipe = gi(L"swipe_distance", 300);
-    o_hq = gi(L"high_quality", 1); o_smooth = gi(L"smooth_motion", 1); o_deband = gi(L"deband_video", 0);
+    o_hq = gi(L"high_quality", 1); o_smooth = gi(L"smooth_motion", 0); o_deband = gi(L"deband_video", 0);
+    o_ultra = gi(L"ultra_quality", 0); o_icc = gi(L"icc_profile", 0); o_next = gi(L"gpu_next", 0);
     o_hwdec = gi(L"hardware_decoding", 1); o_subsize = gi(L"subtitle_size", 40);
     gs(L"subtitle_language", o_slang); gs(L"audio_language", o_alang);
     int ver = gi(L"version", 0);
+    if (ver < 3) o_smooth = 0;                      // lighter default for older PCs
     static wchar_t buf[8192];
     DWORD n = GetPrivateProfileSectionW(L"keys", buf, 8192, g_ini);
     for (auto& s : KM) s.clear();
@@ -384,7 +399,7 @@ static void loadSettings() {
     }
 }
 static void saveSettings() {
-    wi(L"version", 2);
+    wi(L"version", 3); wi(L"ultra_quality", o_ultra); wi(L"icc_profile", o_icc); wi(L"gpu_next", o_next);
     wi(L"autonext", o_autonext); wi(L"remember_volume", o_remvol); wi(L"volume", o_vol); wi(L"start_fullscreen", o_startfs);
     wi(L"always_on_top", o_ontop); wi(L"controls_hide_seconds", o_uisec); wi(L"preload", o_preload); wi(L"invert_swipe", o_inv);
     wi(L"swipe_distance", o_swipe); wi(L"high_quality", o_hq); wi(L"smooth_motion", o_smooth); wi(L"deband_video", o_deband);
@@ -479,7 +494,7 @@ static HMENU menuContext() {
     addStr(m, M_TOP, L"Always on top", o_ontop != 0);
     addStr(m, M_SHOT, L"Screenshot\tP"); addStr(m, M_INFO, L"File info\tI");
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
-    addStr(m, M_QUALITY, L"High quality scaling", o_hq != 0);
+    addStr(m, M_QUALITY, L"Cycle quality (Fast / High / Ultra)");
     addStr(m, M_SETTINGS, L"Settings...\tS");
     addStr(m, M_EXIT, L"Exit\tEsc");
     return m;
@@ -572,7 +587,14 @@ static void act(const std::string& a) {
         osd("Screenshot saved to Pictures");
     }
     else if (a == "delete") doDelete();
-    else if (a == "quality") { o_hq = !o_hq; applyQuality(); osd(o_hq ? "Quality: High" : "Quality: Fast"); saveSettings(); }
+    else if (a == "quality") {
+        int lv = (o_ultra ? 2 : (o_hq ? 1 : 0) ) ;
+        lv = (lv + 1) % 3;
+        o_ultra = (lv == 2); o_hq = (lv >= 1);
+        applyQuality();
+        osd(lv == 2 ? "Quality: Ultra" : (lv == 1 ? "Quality: High" : "Quality: Fast"));
+        saveSettings();
+    }
     else if (a == "settings") openSettings();
     else if (a == "menu") {
         POINT p; GetCursorPos(&p);
@@ -915,14 +937,18 @@ static void onInput(UINT t, WPARAM wp, LPARAM lp) {
         showUI();
         break;
     }
+    pump();                                       // apply the latest zoom/pan/OSD right away (WM_TIMER is starved during input)
 }
 
 static LRESULT CALLBACK HookProc(int c, WPARAM wp, LPARAM lp) {
     if (c == HC_ACTION && wp == PM_REMOVE) {
         MSG* m = (MSG*)lp;
         UINT t = m->message;
-        if (t == WM_KEYDOWN || t == WM_MOUSEMOVE || t == WM_LBUTTONDOWN || t == WM_LBUTTONUP || t == WM_RBUTTONDOWN ||
-            t == WM_RBUTTONUP || t == WM_MBUTTONDOWN || t == WM_MBUTTONUP || t == WM_MOUSEWHEEL || t == WM_MOUSEHWHEEL)
+        if (t == WM_MOUSEMOVE) {                 // keep only the latest position; never build a backlog
+            g_mmLp = m->lParam; g_mmWp = m->wParam;
+            if (InterlockedExchange(&g_mmPending, 1) == 0) PostMessageW(g_mw, 0x8000 + WM_MOUSEMOVE, 0, 0);
+        } else if (t == WM_KEYDOWN || t == WM_LBUTTONDOWN || t == WM_LBUTTONUP || t == WM_RBUTTONDOWN ||
+                   t == WM_RBUTTONUP || t == WM_MBUTTONDOWN || t == WM_MBUTTONUP || t == WM_MOUSEWHEEL || t == WM_MOUSEHWHEEL)
             PostMessageW(g_mw, 0x8000 + t, m->wParam, m->lParam);
     }
     return CallNextHookEx(0, c, wp, lp);
@@ -942,18 +968,21 @@ static void hookIfNeeded() {
 }
 static void wake(void*) { PostMessageW(g_mw, WM_USER + 1, 0, 0); }
 
-// one flush per ~16 ms: applies the latest zoom/pan/seek/OSD instead of one command per input event
-static void flushTick() {
+// Applies the latest state, rate-limited. Called after every input message AND from a fallback timer
+// (WM_TIMER is starved while input messages keep arriving, so relying on it alone made everything feel late).
+static void pump() {
+    double t = nowms();
     DWORD now = GetTickCount();
     if (g_pending >= 0 && now - g_lastLoad >= 90) doLoad();
-    if (g_viewDirty) { sendView(); g_viewDirty = false; }
-    if (g_seekDirty) { char b[48]; snprintf(b, 48, "%.2f", g_seekTarget); cmd("seek", b, "absolute+keyframes"); g_seekDirty = false; }
-    if (g_osdDirty) { osd(g_osdBuf); g_osdDirty = false; }
-    if (g_inter && !g_viewDirty && now - g_lastView > 200) { g_inter = false; applyQuality(); }   // back to full quality
-    if (g_pending < 0 && !g_viewDirty && !g_seekDirty && !g_osdDirty && !g_inter) KillTimer(g_mw, 2);
+    if (g_viewDirty && t - g_tView >= 10) { sendView(); g_viewDirty = false; g_tView = t; }
+    if (g_seekDirty && t - g_tSeek >= 60) { char b[48]; snprintf(b, 48, "%.2f", g_seekTarget); cmd("seek", b, "absolute+keyframes"); g_seekDirty = false; g_tSeek = t; }
+    if (g_osdDirty && t - g_tOsd >= 70) { osd(g_osdBuf); g_osdDirty = false; g_tOsd = t; }
+    if (t - g_tOv >= 100) { overlay(); g_tOv = t; }
+    if (g_pending < 0 && !g_viewDirty && !g_seekDirty && !g_osdDirty && g_timerOn) { KillTimer(g_mw, 2); g_timerOn = false; }
 }
 
 static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == 0x8000 + WM_MOUSEMOVE) { InterlockedExchange(&g_mmPending, 0); onInput(WM_MOUSEMOVE, g_mmWp, g_mmLp); return 0; }
     if (m >= 0x8000 && m < 0xC000) { onInput(m - 0x8000, wp, lp); return 0; }
     if (m == WM_USER + 1) {
         for (;;) {
@@ -986,7 +1015,7 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (m == WM_TIMER) {
-        if (wp == 2) { flushTick(); return 0; }
+        if (wp == 2) { pump(); return 0; }
         hookIfNeeded();
         overlay();
         static DWORD lastAuto;
@@ -1011,10 +1040,13 @@ static Opt OPTS[] = {
     {L"Preload next / previous files in the background", 0, &o_preload, 0},
     {L"Invert touchpad swipe direction", 0, &o_inv, 0},
     {L"Touchpad swipe distance (smaller = more sensitive)", 1, &o_swipe, 0},
-    {L"High quality scaling (uncheck = fast mode for old GPUs)", 0, &o_hq, 1},
+    {L"High quality scaling (uncheck = fastest mode for very old GPUs)", 0, &o_hq, 1},
+    {L"Ultra quality: heaviest scaler, needs a decent GPU", 0, &o_ultra, 1},
     {L"Smooth motion for video (display-resample + interpolation)", 0, &o_smooth, 1},
     {L"Light debanding for video", 0, &o_deband, 1},
     {L"Hardware video decoding", 0, &o_hwdec, 1},
+    {L"Colour-managed display (ICC profile, slower start)", 0, &o_icc, 1},
+    {L"Use gpu-next renderer (better HDR, slower; applies on next open)", 0, &o_next, 1},
     {L"Subtitle size (default 40)", 1, &o_subsize, 1},
     {L"Preferred subtitle language (e.g. en)", 2, o_slang, 1},
     {L"Preferred audio language (e.g. en)", 2, o_alang, 1}};
@@ -1219,15 +1251,20 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     char vol[16], sub[16];
     snprintf(vol, 16, "%d", std::clamp(o_vol, 0, 130));
     snprintf(sub, 16, "%d", std::max(10, o_subsize));
+    wchar_t cd[MAX_PATH];
+    SHGetFolderPathW(0, CSIDL_LOCAL_APPDATA, 0, 0, cd);
+    PathAppendW(cd, L"LiteView"); CreateDirectoryW(cd, 0);
+    PathAppendW(cd, L"cache"); CreateDirectoryW(cd, 0);
+    std::string cache = U8(cd);                              // compiled shaders are cached here: no recompiling on every launch
     const char* o[][2] = {
         {"config", "no"}, {"load-scripts", "no"}, {"ytdl", "no"}, {"terminal", "no"}, {"msg-level", "all=no"},
         // --- renderer / quality ---
-        {"vo", "gpu-next,gpu"},                                  // libplacebo renderer, falls back to classic gpu
+        {"vo", o_next ? "gpu-next,gpu" : "gpu"}, {"gpu-api", "d3d11"}, {"gpu-context", "d3d11"}, {"gpu-shader-cache-dir", cache.c_str()}, {"icc-cache-dir", cache.c_str()},                                  // libplacebo renderer, falls back to classic gpu
         {"hwdec", o_hwdec ? "auto-safe" : "no"},
-        {"scale", o_hq ? "ewa_lanczossharp" : "spline36"},       // upscaling
-        {"dscale", o_hq ? "mitchell" : "hermite"},               // downscaling
-        {"correct-downscaling", "yes"}, {"linear-downscaling", "yes"}, {"sigmoid-upscaling", "yes"},
-        {"icc-profile-auto", "yes"},
+        {"scale", o_ultra ? "ewa_lanczossharp" : (o_hq ? "spline36" : "bilinear")},       // upscaling
+        {"dscale", (o_ultra || o_hq) ? "mitchell" : "hermite"},               // downscaling
+        {"correct-downscaling", "yes"}, {"linear-downscaling", o_ultra ? "yes" : "no"}, {"sigmoid-upscaling", o_ultra ? "yes" : "no"},
+        {"icc-profile-auto", o_icc ? "yes" : "no"},
         {"deband", "no"}, {"deband-iterations", "1"},
         {"interpolation", "no"}, {"tscale", "oversample"}, {"video-sync", "audio"},
         // --- window / ui ---
