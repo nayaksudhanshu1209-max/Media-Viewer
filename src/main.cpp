@@ -869,6 +869,10 @@ static void hookIfNeeded() {
     int64_t id = 0;
     if (p_mpv_get_property(h, "window-id", MPV_FORMAT_INT64, &id) >= 0 && id) {
         g_vw = (HWND)(intptr_t)id;
+        HICON big = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
+        HICON sm = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+        if (big) SendMessageW(g_vw, WM_SETICON, ICON_BIG, (LPARAM)big);
+        if (sm) SendMessageW(g_vw, WM_SETICON, ICON_SMALL, (LPARAM)sm);
         DWORD tid = GetWindowThreadProcessId(g_vw, 0);
         g_hook = SetWindowsHookExW(WH_GETMESSAGE, HookProc, 0, tid);
     }
@@ -1080,6 +1084,7 @@ static void openSettings() {
         WNDCLASSW wc = {};
         wc.lpfnWndProc = SetProc; wc.hInstance = g_inst; wc.lpszClassName = L"LiteViewSettings";
         wc.hCursor = LoadCursorW(0, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.hIcon = LoadIconW(g_inst, MAKEINTRESOURCEW(1));
         RegisterClassW(&wc);
         reg = true;
     }
