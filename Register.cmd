@@ -8,7 +8,10 @@ reg add "%PROG%" /ve /d "LiteView media" /f >nul
 reg add "%PROG%\shell\open\command" /ve /d "\"%EXE%\" \"%%1\"" /f >nul
 reg add "HKCU\Software\Classes\Applications\LiteView.exe\shell\open\command" /ve /d "\"%EXE%\" \"%%1\"" /f >nul
 
+reg add "%PROG%\DefaultIcon" /ve /d "\"%EXE%\",0" /f >nul
+reg add "HKCU\Software\Classes\Applications\LiteView.exe\DefaultIcon" /ve /d "\"%EXE%\",0" /f >nul
 reg add "%CAP%" /v ApplicationName /d "LiteView" /f >nul
+reg add "%CAP%" /v ApplicationIcon /d "\"%EXE%\",0" /f >nul
 reg add "%CAP%" /v ApplicationDescription /d "Instant photo and video viewer" /f >nul
 
 for %%e in (jpg jpeg jfif png gif webp bmp tif tiff avif jxl ico apng mp4 mkv avi mov wmv webm flv m4v ts mpg mpeg 3gp m2ts ogv vob) do (
