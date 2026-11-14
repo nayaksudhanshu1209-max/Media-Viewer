@@ -21,8 +21,10 @@ jobs:
       - name: Compile
         shell: bash
         run: |
+          windres app.rc -O coff -o app.o
           g++ -std=c++17 -Os -s -mwindows -municode -static -Idev/include \
-              -o LiteView.exe src/main.cpp -lshlwapi -lshell32 -luser32
+              -o LiteView.exe src/main.cpp app.o \
+              -lcomctl32 -lcomdlg32 -lshlwapi -lshell32 -luser32 -lgdi32 -ladvapi32
 
       - name: Package
         shell: bash
