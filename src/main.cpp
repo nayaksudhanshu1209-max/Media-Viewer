@@ -1,8 +1,13 @@
 // LiteView - tiny photo/video viewer. Engine: libmpv (loaded at runtime). UI/input/overlay: this file.
+#ifndef UNICODE
 #define UNICODE
+#endif
+#ifndef _UNICODE
 #define _UNICODE
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <windowsx.h>
 #include <shlwapi.h>
 #include <shlobj.h>
@@ -42,8 +47,9 @@ static std::string U8(const std::wstring& w) {
     s.resize(n - 1);
     return s;
 }
-static void cmd(const char* a, const char* b = 0, const char* c = 0, const char* d = 0) {
-    const char* v[] = {a, b, c, d, 0};
+static void cmd(const char* a, const char* b = 0, const char* c = 0, const char* d = 0,
+                const char* e = 0, const char* f = 0, const char* g = 0) {
+    const char* v[] = {a, b, c, d, e, f, g, 0};
     p_mpv_command(h, v);
 }
 static void setp(const char* n, const char* v) { p_mpv_set_property_string(h, n, v); }
