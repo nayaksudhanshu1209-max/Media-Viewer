@@ -1,0 +1,37 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download libmpv (open-source mpv engine, non-AVX2 build)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R zhongfly/mpv-winbuild -p "mpv-dev-x86_64-2*.7z" -D dl
+          7z x dl/*.7z -odev -y
+          find dev -maxdepth 2
+
+      - name: Compile
+        shell: bash
+        run: |
+          g++ -std=c++17 -Os -s -mwindows -municode -static -Idev/include \
+              -o LiteView.exe src/main.cpp -lshlwapi -lshell32 -luser32
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp LiteView.exe Register.cmd dist/
+          cp "$(find dev -name libmpv-2.dll | head -n1)" dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiteView
+          path: dist/
