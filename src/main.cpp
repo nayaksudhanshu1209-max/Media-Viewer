@@ -1,4 +1,11 @@
 // LiteView - tiny photo/video viewer. Engine: libmpv (loaded at runtime). UI/input/overlay/settings: this file.
+//
+// Performance rules used throughout:
+//  * Never ask mpv for a value on a hot path (it blocks while the core is decoding). The app keeps its own copy of
+//    volume/zoom/pan/etc. and mpv pushes time/pause/duration to us through observed properties.
+//  * All commands/property sets are asynchronous (queued, never waited for).
+//  * Zoom/pan/seek/OSD updates from touchpad or mouse are coalesced into one update per ~16 ms.
+//  * Rapid next/previous only loads the latest target (max ~11 loads per second).
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -17,7 +24,9 @@
 #include <vector>
 #include <algorithm>
 #include <cstdio>
+#include <cstdarg>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <mpv/client.h>
 
@@ -26,10 +35,11 @@
 F(mpv_handle*, mpv_create, (void))
 F(int, mpv_initialize, (mpv_handle*))
 F(int, mpv_set_option_string, (mpv_handle*, const char*, const char*))
-F(int, mpv_set_property_string, (mpv_handle*, const char*, const char*))
 F(char*, mpv_get_property_string, (mpv_handle*, const char*))
 F(int, mpv_get_property, (mpv_handle*, const char*, mpv_format, void*))
-F(int, mpv_command, (mpv_handle*, const char**))
+F(int, mpv_command_async, (mpv_handle*, uint64_t, const char**))
+F(int, mpv_set_property_async, (mpv_handle*, uint64_t, const char*, mpv_format, void*))
+F(int, mpv_observe_property, (mpv_handle*, uint64_t, const char*, mpv_format))
 F(mpv_event*, mpv_wait_event, (mpv_handle*, double))
 F(void, mpv_set_wakeup_callback, (mpv_handle*, void (*)(void*), void*))
 F(void, mpv_terminate_destroy, (mpv_handle*))
@@ -43,7 +53,8 @@ static std::vector<std::wstring> files;
 static CRITICAL_SECTION g_fl;        // guards `files` (preload thread reads it)
 static volatile LONG g_flGen;
 static int idx;
-static bool g_isVid, g_ov, g_fixed;
+static bool g_isVid, g_ov;
+static bool g_fixed;
 static int g_shown = -1;
 static DWORD g_ui;
 static std::string KM[256];          // vk -> action
@@ -55,6 +66,18 @@ static wchar_t o_slang[16], o_alang[16];
 
 static volatile LONG g_preIdx = -1;
 static HANDLE g_preEv;
+
+// ---- state we own / cache (no round trips to mpv) ----
+static double c_dur, c_pos;                 // pushed by mpv (observed)
+static bool c_pause, c_eof;                 // pushed by mpv (observed)
+static double s_vol = 100, s_bright, s_zoom, s_px, s_py, s_speed = 1, s_subdelay, s_audiodelay, s_subscale = 1;
+static int s_rot;
+static bool s_mute, s_loop;
+static bool g_viewDirty, g_osdDirty, g_seekDirty, g_inter;
+static double g_seekTarget;
+static char g_osdBuf[96];
+static DWORD g_lastView, g_lastLoad;
+static int g_pending = -1, g_mode = -1;     // g_mode: 0 photo, 1 video
 
 // ======================= helpers =======================
 static std::string U8(const std::wstring& w) {
@@ -71,17 +94,15 @@ static std::wstring Wd(const std::string& s) {
     w.resize(n - 1);
     return w;
 }
+// async command (never blocks)
 static void cmd(const char* a, const char* b = 0, const char* c = 0, const char* d = 0,
                 const char* e = 0, const char* f = 0, const char* g = 0) {
     const char* v[] = {a, b, c, d, e, f, g, 0};
-    p_mpv_command(h, v);
+    p_mpv_command_async(h, 0, v);
 }
-static void setp(const char* n, const char* v) { p_mpv_set_property_string(h, n, v); }
-static void setd(const char* n, double v) { char b[64]; snprintf(b, 64, "%.4f", v); setp(n, b); }
-static double getd(const char* n, double d = 0) {
-    double v;
-    return p_mpv_get_property(h, n, MPV_FORMAT_DOUBLE, &v) >= 0 ? v : d;
-}
+static void setp(const char* n, const char* v) { const char* s = v; p_mpv_set_property_async(h, 0, n, MPV_FORMAT_STRING, &s); }
+static void setd(const char* n, double v) { p_mpv_set_property_async(h, 0, n, MPV_FORMAT_DOUBLE, &v); }
+// blocking read: ONLY for user-initiated rare things (menus, info)
 static std::string mgets(const char* n) {
     char* s = p_mpv_get_property_string(h, n);
     std::string r = s ? s : "";
@@ -90,6 +111,15 @@ static std::string mgets(const char* n) {
 }
 static bool isYes(const char* n) { return mgets(n) == "yes"; }
 static void osd(const char* s) { cmd("show-text", s, "1000"); }
+static void osdf(const char* fmt, ...) {
+    char b[160]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    osd(b);
+}
+static void osdLater(const char* fmt, ...) {      // coalesced: only the latest text is sent
+    va_list ap; va_start(ap, fmt); vsnprintf(g_osdBuf, sizeof g_osdBuf, fmt, ap); va_end(ap);
+    g_osdDirty = true;
+}
+static void kick() { SetTimer(g_mw, 2, 16, 0); }  // starts the ~60 Hz flush timer (stops itself when idle)
 static void showUI() { g_ui = GetTickCount() + std::max(1, o_uisec) * 1000; }
 
 // ======================= file list =======================
@@ -129,8 +159,9 @@ static void scan(const std::wstring& file) {         // fills `files`, sets idx 
 
 // ======================= quality / per-mode settings =======================
 static void applyQuality() {
-    setp("scale", o_hq ? "ewa_lanczossharp" : "spline36");   // upscaling
-    setp("dscale", o_hq ? "mitchell" : "hermite");           // downscaling (no dots / moire)
+    // heavy EWA upscaler is swapped for bilinear while you are actively zooming/panning (g_inter), then restored
+    setp("scale", !o_hq ? "spline36" : (g_inter ? "bilinear" : "ewa_lanczossharp"));
+    setp("dscale", o_hq ? "mitchell" : "hermite");           // downscaling in linear light: no dots / moire
 }
 static void applyMode(bool vid) {
     if (vid) {
@@ -146,25 +177,49 @@ static void applyMode(bool vid) {
 }
 static void applyRuntime() {
     applyQuality();
-    applyMode(g_isVid);
+    g_mode = -1; applyMode(g_isVid); g_mode = g_isVid ? 1 : 0;
     setp("hwdec", o_hwdec ? "auto-safe" : "no");
     setp("ontop", o_ontop ? "yes" : "no");
     char b[16]; snprintf(b, 16, "%d", std::max(10, o_subsize)); setp("sub-font-size", b);
 }
 
-static void openIdx(int i) {
-    idx = i;
+// ======================= view state (zoom / pan / volume ...) =======================
+static void sendView() { setd("video-zoom", s_zoom); setd("video-pan-x", s_px); setd("video-pan-y", s_py); }
+static void viewChanged() {
+    g_viewDirty = true;
+    g_lastView = GetTickCount();
+    if (!g_inter && o_hq) { g_inter = true; setp("scale", "bilinear"); }
+    kick();
+}
+static void setVol(double v) { s_vol = std::clamp(v, 0.0, 130.0); setd("volume", s_vol); }
+static void setBright(double v) { s_bright = std::clamp(v, -100.0, 100.0); setd("brightness", s_bright); }
+static void setSpeed(double v) { s_speed = std::clamp(floor(v * 100 + 0.5) / 100, 0.1, 8.0); setd("speed", s_speed); }
+
+// ======================= loading =======================
+static void doLoad() {
+    int i = g_pending; g_pending = -1;
+    if (i < 0 || i >= (int)files.size()) return;
+    g_lastLoad = GetTickCount();
     std::wstring p = files[i];
     std::wstring e = PathFindExtensionW(p.c_str());
     for (auto& c : e) c = towlower(c);
-    g_isVid = !isImg(e);
-    applyMode(g_isVid);
-    setp("video-zoom", "0"); setp("video-pan-x", "0"); setp("video-pan-y", "0"); setp("video-rotate", "0");
-    setp("loop-file", (e == L".gif" || e == L".webp" || e == L".apng") ? "inf" : "no");
+    bool vid = !isImg(e);
+    g_isVid = vid;
+    if (g_mode != (vid ? 1 : 0)) { g_mode = vid ? 1 : 0; applyMode(vid); }
+    if (s_zoom != 0 || s_px != 0 || s_py != 0) { s_zoom = s_px = s_py = 0; sendView(); }
+    if (s_rot) { s_rot = 0; setd("video-rotate", 0); }
+    bool lp = (e == L".gif" || e == L".webp" || e == L".apng");
+    if (lp != s_loop) { s_loop = lp; setp("loop-file", lp ? "inf" : "no"); }
     std::string u = U8(p);
     cmd("loadfile", u.c_str(), "replace");
     setp("pause", "no");
+}
+static void openIdx(int i) {
+    idx = i;
+    g_pending = i;
     showUI();
+    if (GetTickCount() - g_lastLoad >= 90) doLoad();     // first request loads at once; a burst only loads the latest
+    else kick();
 }
 static void go(int d) {
     int n = (int)files.size();
@@ -176,6 +231,7 @@ static void setFiles(const std::wstring& path) {
     scan(path);
     InterlockedIncrement(&g_flGen);
     LeaveCriticalSection(&g_fl);
+    g_lastLoad = 0;
     openIdx(idx);
 }
 
@@ -208,7 +264,7 @@ static DWORD WINAPI preloadThread(LPVOID) {
             LARGE_INTEGER sz = {};
             GetFileSizeEx(f, &sz);
             bool vid = !isImg(std::wstring(PathFindExtensionW(paths[c].c_str())));
-            long long head = vid ? (4LL << 20) : (32LL << 20), done = 0;
+            long long head = vid ? (4LL << 20) : (16LL << 20), done = 0;
             DWORD got = 0;
             bool abort = false;
             while (done < head && done < sz.QuadPart) {
@@ -383,16 +439,15 @@ static HMENU menuAudio() {
     HMENU m = CreatePopupMenu();
     addTracks(m, "audio", 1000);
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
-    addStr(m, M_MUTE, L"Mute", isYes("mute"));
+    addStr(m, M_MUTE, L"Mute", s_mute);
     addStr(m, M_AUDDM, L"Audio delay -0.1 s"); addStr(m, M_AUDDP, L"Audio delay +0.1 s");
     return m;
 }
 static HMENU menuSpeed() {
     HMENU m = CreatePopupMenu();
-    double sp = getd("speed", 1);
     for (int i = 0; i < 9; i++) {
         wchar_t b[24]; _snwprintf(b, 24, L"%gx", SPEEDS[i]);
-        addStr(m, 200 + i, b, fabs(sp - SPEEDS[i]) < 0.01);
+        addStr(m, 200 + i, b, fabs(s_speed - SPEEDS[i]) < 0.01);
     }
     return m;
 }
@@ -410,13 +465,13 @@ static HMENU menuContext() {
     addStr(m, M_PREV, L"Previous\tLeft"); addStr(m, M_NEXT, L"Next\tRight");
     if (g_isVid) {
         AppendMenuW(m, MF_SEPARATOR, 0, 0);
-        addStr(m, M_PLAY, isYes("pause") ? L"Play\tSpace" : L"Pause\tSpace");
+        addStr(m, M_PLAY, c_pause ? L"Play\tSpace" : L"Pause\tSpace");
         addStr(m, M_BACK, L"Back 10 s"); addStr(m, M_FWD, L"Forward 10 s");
         AppendMenuW(m, MF_POPUP, (UINT_PTR)menuSpeed(), L"Speed");
         AppendMenuW(m, MF_POPUP, (UINT_PTR)menuAudio(), L"Audio");
         AppendMenuW(m, MF_POPUP, (UINT_PTR)menuSubs(), L"Subtitles");
         AppendMenuW(m, MF_POPUP, (UINT_PTR)menuAspect(), L"Aspect ratio");
-        addStr(m, M_LOOP, L"Loop", mgets("loop-file") == "inf");
+        addStr(m, M_LOOP, L"Loop", s_loop);
     }
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
     addStr(m, M_ZRESET, L"Reset zoom\t0"); addStr(m, M_ROTATE, L"Rotate\tR");
@@ -446,6 +501,7 @@ static bool pickFile(wchar_t* out, const wchar_t* filter) {
     return GetOpenFileNameW(&o) != 0;
 }
 static void openSettings();
+void menuCmd(int id);
 
 static void doDelete() {
     if (idx < 0 || idx >= (int)files.size()) return;
@@ -455,6 +511,7 @@ static void doDelete() {
     InterlockedIncrement(&g_flGen);
     LeaveCriticalSection(&g_fl);
     bool empty = files.empty();
+    g_lastLoad = 0;                                    // load the next file immediately so mpv releases the old one
     if (empty) cmd("stop"); else openIdx(std::min(idx, (int)files.size() - 1));
     std::wstring from = path; from.push_back(L'\0');
     SHFILEOPSTRUCTW op = {};
@@ -467,6 +524,14 @@ static void doDelete() {
 }
 
 // ======================= actions =======================
+static void showInfo() {
+    std::string nm = U8(PathFindFileNameW(files[idx].c_str()));
+    std::string w = mgets("video-params/w"), hh = mgets("video-params/h"), fm = mgets("file-format");
+    double mb = atof(mgets("file-size").c_str()) / 1048576.0;
+    char b[600];
+    snprintf(b, sizeof b, "%s\n%sx%s    %.1f MB    %s", nm.c_str(), w.c_str(), hh.c_str(), mb, fm.c_str());
+    cmd("show-text", b, "3500");
+}
 static void act(const std::string& a) {
     if (a == "close") cmd("quit");
     else if (a == "next") go(1);
@@ -474,29 +539,29 @@ static void act(const std::string& a) {
     else if (a == "first") openIdx(0);
     else if (a == "last") openIdx((int)files.size() - 1);
     else if (a == "pause") cmd("cycle", "pause");
-    else if (a == "volup") { cmd("add", "volume", "5"); osd("Volume ${volume}%"); }
-    else if (a == "voldown") { cmd("add", "volume", "-5"); osd("Volume ${volume}%"); }
-    else if (a == "mute") { cmd("cycle", "mute"); osd("Mute: ${mute}"); }
+    else if (a == "volup") { setVol(s_vol + 5); osdf("Volume %d%%", (int)floor(s_vol + 0.5)); }
+    else if (a == "voldown") { setVol(s_vol - 5); osdf("Volume %d%%", (int)floor(s_vol + 0.5)); }
+    else if (a == "mute") { s_mute = !s_mute; setp("mute", s_mute ? "yes" : "no"); osd(s_mute ? "Muted" : "Sound on"); }
     else if (a == "fullscreen") cmd("cycle", "fullscreen");
     else if (a == "seekfwd") cmd("seek", "5");
     else if (a == "seekback") cmd("seek", "-5");
     else if (a == "framenext") cmd("frame-step");
     else if (a == "frameback") cmd("frame-back-step");
-    else if (a == "zoomin") cmd("add", "video-zoom", "0.1");
-    else if (a == "zoomout") cmd("add", "video-zoom", "-0.1");
-    else if (a == "zoomreset") { setp("video-zoom", "0"); setp("video-pan-x", "0"); setp("video-pan-y", "0"); }
-    else if (a == "rotate") cmd("cycle-values", "video-rotate", "90", "180", "270", "0");
-    else if (a == "brightup") { cmd("add", "brightness", "3"); osd("Brightness ${brightness}"); }
-    else if (a == "brightdown") { cmd("add", "brightness", "-3"); osd("Brightness ${brightness}"); }
-    else if (a == "speedup") { cmd("multiply", "speed", "1.1"); osd("Speed ${speed}x"); }
-    else if (a == "speeddown") { cmd("multiply", "speed", "0.9091"); osd("Speed ${speed}x"); }
-    else if (a == "speedreset") { setp("speed", "1"); osd("Speed 1x"); }
-    else if (a == "subcycle") { cmd("cycle", "sub"); osd("Subtitles: ${sid}"); }
-    else if (a == "audiocycle") { cmd("cycle", "audio"); osd("Audio track: ${aid}"); }
-    else if (a == "subdelayminus") { cmd("add", "sub-delay", "-0.1"); osd("Subtitle delay ${sub-delay}"); }
-    else if (a == "subdelayplus") { cmd("add", "sub-delay", "0.1"); osd("Subtitle delay ${sub-delay}"); }
-    else if (a == "loop") { cmd("cycle-values", "loop-file", "inf", "no"); osd("Loop: ${loop-file}"); }
-    else if (a == "info") cmd("show-text", "${filename}\n${width}x${height}   ${file-size}\n${file-format}", "3500");
+    else if (a == "zoomin") { s_zoom = std::min(6.0, s_zoom + 0.1); viewChanged(); osdLater("Zoom %d%%", (int)(100 * pow(2.0, s_zoom))); }
+    else if (a == "zoomout") { s_zoom = std::max(-1.0, s_zoom - 0.1); if (s_zoom <= 0.001) s_px = s_py = 0; viewChanged(); osdLater("Zoom %d%%", (int)(100 * pow(2.0, s_zoom))); }
+    else if (a == "zoomreset") { s_zoom = s_px = s_py = 0; viewChanged(); osdLater("Zoom 100%%"); }
+    else if (a == "rotate") { s_rot = (s_rot + 90) % 360; setd("video-rotate", s_rot); }
+    else if (a == "brightup") { setBright(s_bright + 3); osdf("Brightness %d", (int)floor(s_bright + 0.5)); }
+    else if (a == "brightdown") { setBright(s_bright - 3); osdf("Brightness %d", (int)floor(s_bright + 0.5)); }
+    else if (a == "speedup") { setSpeed(s_speed * 1.1); osdf("Speed %gx", s_speed); }
+    else if (a == "speeddown") { setSpeed(s_speed / 1.1); osdf("Speed %gx", s_speed); }
+    else if (a == "speedreset") { setSpeed(1); osd("Speed 1x"); }
+    else if (a == "subcycle") { cmd("cycle", "sub"); std::string s = mgets("sid"); osdf("Subtitles: %s", (s == "no" || s.empty()) ? "Off" : ("track " + s).c_str()); }
+    else if (a == "audiocycle") { cmd("cycle", "audio"); std::string s = mgets("aid"); osdf("Audio: %s", (s == "no" || s.empty()) ? "Off" : ("track " + s).c_str()); }
+    else if (a == "subdelayminus") { s_subdelay -= 0.1; setd("sub-delay", s_subdelay); osdf("Subtitle delay %+.1f s", s_subdelay); }
+    else if (a == "subdelayplus") { s_subdelay += 0.1; setd("sub-delay", s_subdelay); osdf("Subtitle delay %+.1f s", s_subdelay); }
+    else if (a == "loop") { s_loop = !s_loop; setp("loop-file", s_loop ? "inf" : "no"); osd(s_loop ? "Loop: on" : "Loop: off"); }
+    else if (a == "info") showInfo();
     else if (a == "screenshot") {
         wchar_t d[MAX_PATH];
         SHGetFolderPathW(0, CSIDL_MYPICTURES, 0, 0, d);
@@ -512,7 +577,6 @@ static void act(const std::string& a) {
     else if (a == "menu") {
         POINT p; GetCursorPos(&p);
         int id = popup(menuContext(), p.x, p.y);
-        extern void menuCmd(int);
         if (id) menuCmd(id);
     }
 }
@@ -520,7 +584,7 @@ void menuCmd(int id) {
     char b[64];
     if (id >= 2000 && id < 3000) { snprintf(b, 64, "%d", id - 2000); setp("sid", b); return; }
     if (id >= 1000 && id < 2000) { snprintf(b, 64, "%d", id - 1000); setp("aid", b); return; }
-    if (id >= 200 && id < 300) { setd("speed", SPEEDS[id - 200]); osd("Speed ${speed}x"); return; }
+    if (id >= 200 && id < 300) { setSpeed(SPEEDS[id - 200]); osdf("Speed %gx", s_speed); return; }
     if (id >= 100 && id < 200) { setp("video-aspect-override", ASPECTS[id - 100]); return; }
     switch (id) {
     case M_OPEN: {
@@ -557,10 +621,10 @@ void menuCmd(int id) {
     }
     case M_SUBDM: act("subdelayminus"); break;
     case M_SUBDP: act("subdelayplus"); break;
-    case M_SUBSM: cmd("add", "sub-scale", "-0.1"); osd("Subtitle size ${sub-scale}"); break;
-    case M_SUBBG: cmd("add", "sub-scale", "0.1"); osd("Subtitle size ${sub-scale}"); break;
-    case M_AUDDM: cmd("add", "audio-delay", "-0.1"); osd("Audio delay ${audio-delay}"); break;
-    case M_AUDDP: cmd("add", "audio-delay", "0.1"); osd("Audio delay ${audio-delay}"); break;
+    case M_SUBSM: s_subscale = std::max(0.3, s_subscale - 0.1); setd("sub-scale", s_subscale); osdf("Subtitle size %d%%", (int)floor(s_subscale * 100 + 0.5)); break;
+    case M_SUBBG: s_subscale = std::min(3.0, s_subscale + 0.1); setd("sub-scale", s_subscale); osdf("Subtitle size %d%%", (int)floor(s_subscale * 100 + 0.5)); break;
+    case M_AUDDM: s_audiodelay -= 0.1; setd("audio-delay", s_audiodelay); osdf("Audio delay %+.1f s", s_audiodelay); break;
+    case M_AUDDP: s_audiodelay += 0.1; setd("audio-delay", s_audiodelay); osdf("Audio delay %+.1f s", s_audiodelay); break;
     case M_MUTE: act("mute"); break;
     }
 }
@@ -595,12 +659,13 @@ static void fmt(double s, char* o) {
     if (t >= 3600) sprintf(o, "%d:%02d:%02d", t / 3600, t / 60 % 60, t % 60);
     else sprintf(o, "%d:%02d", t / 60, t % 60);
 }
-static bool controlsVisible() { return GetTickCount() < g_ui || (g_isVid && isYes("pause")); }
+static bool controlsVisible() { return GetTickCount() < g_ui || (g_isVid && c_pause); }
 
 static void overlay() {
     if (!g_vw) return;
+    static std::string last;
     if (!controlsVisible()) {
-        if (g_ov) { const char* a[] = {"osd-overlay", "1", "none", "", 0}; p_mpv_command(h, a); g_ov = false; }
+        if (g_ov) { const char* a[] = {"osd-overlay", "1", "none", "", 0}; p_mpv_command_async(h, 0, a); g_ov = false; last.clear(); }
         return;
     }
     RECT r; GetClientRect(g_vw, &r);
@@ -612,9 +677,9 @@ static void overlay() {
     int n = 0, fs, m = W * 4 / 100;
     layout(W, H);
     fs = g_fs;
-    double dur = g_isVid ? getd("duration") : 0;
+    double dur = (g_isVid && g_mode == 1) ? c_dur : 0;
     #define EMIT(...) do { n += snprintf(buf + n, sizeof(buf) - n, __VA_ARGS__); } while (0)
-    if (dur > 0) {                               // dark gradient-ish scrim behind the controls
+    if (dur > 0) {                               // dark scrim behind the controls
         int top = g_rowY - g_rh / 2;
         EMIT("{\\an7\\pos(0,%d)\\bord0\\shad0\\1c&H000000&\\1a&H90&\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}\n", top, W, W, H - top, H - top);
     }
@@ -622,14 +687,13 @@ static void overlay() {
     for (auto& c : nm) if (c == '{' || c == '}') c = '('; else if (c == '\\') c = '/';
     EMIT("{\\an7\\pos(%d,%d)\\fs%d\\bord2\\shad0\\1c&HFFFFFF&\\3c&H000000&\\3a&H60&}%s   %d/%d", m, m / 2, fs, nm.c_str(), si + 1, (int)files.size());
     if (dur > 0) {
-        double pos = getd("time-pos"), f = std::clamp(pos / dur, 0.0, 1.0);
+        double pos = c_pos, f = std::clamp(pos / dur, 0.0, 1.0);
         int fw = (int)(g_bw * f);
         char t1[16], t2[16]; fmt(pos, t1); fmt(dur, t2);
         EMIT("\n{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HA0&\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}", g_bx, g_by, g_bw, g_bw, g_bh, g_bh);
         EMIT("\n{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c&HFFFFFF&\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}", g_bx, g_by, fw, fw, g_bh, g_bh);
         EMIT("\n{\\an4\\pos(%d,%d)\\fs%d\\bord2\\shad0\\1c&HFFFFFF&\\3c&H000000&\\3a&H60&}%s / %s", m, g_rowY + g_rh / 2, fs, t1, t2);
-        bool paused = isYes("pause");
-        char sp[16]; snprintf(sp, 16, "%gx", getd("speed", 1));
+        char sp[16]; snprintf(sp, 16, "%gx", s_speed);
         for (int i = 0; i < g_nb; i++) {
             Btn& b = g_b[i];
             int cx = b.x + b.w / 2, cy = b.y + b.h / 2, a = g_rh * 2 / 5, ox = cx - a / 2, oy = cy - a / 2;
@@ -637,7 +701,7 @@ static void overlay() {
             const char* txt = 0;
             switch (b.id) {
             case B_PLAY:
-                if (paused) snprintf(p, 200, "m 0 0 l %d %d l 0 %d", a * 9 / 10, a / 2, a);
+                if (c_pause) snprintf(p, 200, "m 0 0 l %d %d l 0 %d", a * 9 / 10, a / 2, a);
                 else snprintf(p, 200, "m 0 0 l %d 0 l %d %d l 0 %d m %d 0 l %d 0 l %d %d l %d %d", a * 3 / 10, a * 3 / 10, a, a, a * 7 / 10, a, a, a, a * 7 / 10, a);
                 EMIT("\n{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c&HFFFFFF&\\p1}%s{\\p0}", ox, oy, p);
                 break;
@@ -660,13 +724,16 @@ static void overlay() {
         }
     }
     char ws[16], hs[16]; sprintf(ws, "%d", W); sprintf(hs, "%d", H);
+    std::string cur = std::string(buf) + "|" + ws + "x" + hs;
+    if (cur == last) return;                      // nothing changed: don't make mpv redraw the frame
+    last = cur;
     const char* a[] = {"osd-overlay", "1", "ass-events", buf, ws, hs, 0};
-    p_mpv_command(h, a);
+    p_mpv_command_async(h, 0, a);
     g_ov = true;
 }
 
 static int hitBtn(int x, int y, int W, int H) {
-    if (!g_isVid || !controlsVisible()) return 0;
+    if (!g_isVid || g_mode != 1 || !controlsVisible()) return 0;
     layout(W, H);
     for (int i = 0; i < g_nb; i++)
         if (x >= g_b[i].x && x < g_b[i].x + g_b[i].w && y >= g_b[i].y && y < g_b[i].y + g_b[i].h) return g_b[i].id;
@@ -698,20 +765,15 @@ static int dx0, dy0, rx, ry, rmode, mx, my, downBtn;
 static DWORD lastDown, lastH, navCool, tpUntil;
 static double sB, sV, sPos, sZ, hAcc, sAcc;
 
-// zoom keeping the point under (x,y) roughly fixed; drives video-zoom / video-pan on the GPU (no window resize)
+// zoom keeping the point under (x,y) roughly fixed; only changes video-zoom/video-pan (GPU), never the window size
 static double zoomAt(double nz, int x, int y, int W, int H) {
     nz = std::clamp(nz, -1.0, 6.0);
-    double z0 = getd("video-zoom");
-    if (nz <= 0.001) {
-        setd("video-zoom", nz); setp("video-pan-x", "0"); setp("video-pan-y", "0");
-        return nz;
-    }
-    double s = pow(2.0, nz - z0), zf = pow(2.0, z0);
-    double kx = (x - W / 2.0) / (W * zf) * (1.0 / s - 1.0);
-    double ky = (y - H / 2.0) / (H * zf) * (1.0 / s - 1.0);
-    setd("video-pan-x", std::clamp(getd("video-pan-x") + kx, -3.0, 3.0));
-    setd("video-pan-y", std::clamp(getd("video-pan-y") + ky, -3.0, 3.0));
-    setd("video-zoom", nz);
+    if (nz <= 0.001) { s_zoom = nz; s_px = s_py = 0; viewChanged(); return nz; }
+    double s = pow(2.0, nz - s_zoom), zf = pow(2.0, s_zoom);
+    s_px = std::clamp(s_px + (x - W / 2.0) / (W * zf) * (1.0 / s - 1.0), -3.0, 3.0);
+    s_py = std::clamp(s_py + (y - H / 2.0) / (H * zf) * (1.0 / s - 1.0), -3.0, 3.0);
+    s_zoom = nz;
+    viewChanged();
     return nz;
 }
 
@@ -728,11 +790,11 @@ static void onWheel(UINT t, WPARAM wp, LPARAM lp) {
     int W = std::max<int>(1, r.right), H = std::max<int>(1, r.bottom);
     bool ctrl = (LOWORD(wp) & MK_CONTROL) || GetKeyState(VK_CONTROL) < 0;   // pinch arrives as Ctrl+wheel
     bool shift = (LOWORD(wp) & MK_SHIFT) != 0;
-    double z = getd("video-zoom"), zf = pow(2.0, z);
+    double zf = pow(2.0, s_zoom);
     char b[96];
 
     if (t == WM_MOUSEHWHEEL) {                   // two-finger horizontal swipe
-        if (z > 0.01) { setd("video-pan-x", std::clamp(getd("video-pan-x") - d * 100.0 / (W * zf), -3.0, 3.0)); return; }
+        if (s_zoom > 0.01) { s_px = std::clamp(s_px - d * 100.0 / (W * zf), -3.0, 3.0); viewChanged(); return; }
         if (o_inv) d = -d;
         if (!g_isVid) {
             if (now - lastH > 250) hAcc = 0;
@@ -746,21 +808,21 @@ static void onWheel(UINT t, WPARAM wp, LPARAM lp) {
         }
         return;
     }
-    if (ctrl) {
-        double nz = zoomAt(z + 0.2 * d, pt.x, pt.y, W, H);
-        snprintf(b, 96, "Zoom %d%%", (int)(100 * pow(2.0, nz))); osd(b);
+    if (ctrl) {                                  // pinch (or Ctrl+wheel)
+        double nz = zoomAt(s_zoom + 0.2 * d, pt.x, pt.y, W, H);
+        osdLater("Zoom %d%%", (int)(100 * pow(2.0, nz)));
         return;
     }
-    if (!tp) {
+    if (!tp) {                                   // classic mouse wheel
         if (!g_isVid) {
-            double nz = zoomAt(z + 0.15 * d, pt.x, pt.y, W, H);
-            snprintf(b, 96, "Zoom %d%%", (int)(100 * pow(2.0, nz))); osd(b);
+            double nz = zoomAt(s_zoom + 0.15 * d, pt.x, pt.y, W, H);
+            osdLater("Zoom %d%%", (int)(100 * pow(2.0, nz)));
         } else if (shift) { snprintf(b, 96, "%d", (int)(d * 5)); cmd("seek", b); }
-        else { setd("volume", std::clamp(getd("volume") + d * 5, 0.0, 130.0)); osd("Volume ${volume}%"); }
+        else { setVol(s_vol + d * 5); osdLater("Volume %d%%", (int)floor(s_vol + 0.5)); kick(); }
         return;
     }
-    if (z > 0.01) setd("video-pan-y", std::clamp(getd("video-pan-y") + d * 100.0 / (H * zf), -3.0, 3.0));
-    else if (g_isVid) { setd("volume", std::clamp(getd("volume") + d * 3, 0.0, 130.0)); osd("Volume ${volume}%"); }
+    if (s_zoom > 0.01) { s_py = std::clamp(s_py + d * 100.0 / (H * zf), -3.0, 3.0); viewChanged(); }
+    else if (g_isVid) { setVol(s_vol + d * 3); osdLater("Volume %d%%", (int)floor(s_vol + 0.5)); kick(); }
 }
 
 static void onInput(UINT t, WPARAM wp, LPARAM lp) {
@@ -780,10 +842,11 @@ static void onInput(UINT t, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE:
         showUI();
         if (md) {
-            double zf = pow(2.0, getd("video-zoom"));
-            setd("video-pan-x", getd("video-pan-x") + (x - mx) / (W * zf));
-            setd("video-pan-y", getd("video-pan-y") + (y - my) / (H * zf));
+            double zf = pow(2.0, s_zoom);
+            s_px = std::clamp(s_px + (x - mx) / (W * zf), -3.0, 3.0);
+            s_py = std::clamp(s_py + (y - my) / (H * zf), -3.0, 3.0);
             mx = x; my = y;
+            viewChanged();
         }
         if (rd) {
             int dx = x - rx, dy = y - ry;
@@ -793,14 +856,14 @@ static void onInput(UINT t, WPARAM wp, LPARAM lp) {
                 if (rmode == 3 && !g_isVid) rmode = -1;
             }
             if (rmode == 1) {
-                setd("brightness", std::clamp(sB - dy * 200.0 / H, -100.0, 100.0));
-                osd("Brightness ${brightness}");
+                setBright(sB - dy * 200.0 / H);
+                osdLater("Brightness %d", (int)floor(s_bright + 0.5)); kick();
             } else if (rmode == 2) {
-                if (g_isVid) { setd("volume", std::clamp(sV - dy * 150.0 / H, 0.0, 130.0)); osd("Volume ${volume}%"); }
-                else { double z = zoomAt(sZ - dy * 3.0 / H, W / 2, H / 2, W, H); snprintf(b, 96, "Zoom %d%%", (int)(100 * pow(2.0, z))); osd(b); }
-            } else if (rmode == 3) {
-                double d = getd("duration");
-                if (d > 0) { snprintf(b, 96, "%.2f", std::clamp(sPos + dx * d / W, 0.0, d)); cmd("seek", b, "absolute+keyframes"); }
+                if (g_isVid) { setVol(sV - dy * 150.0 / H); osdLater("Volume %d%%", (int)floor(s_vol + 0.5)); kick(); }
+                else { double z = zoomAt(sZ - dy * 3.0 / H, W / 2, H / 2, W, H); osdLater("Zoom %d%%", (int)(100 * pow(2.0, z))); }
+            } else if (rmode == 3 && c_dur > 0) {
+                g_seekTarget = std::clamp(sPos + dx * c_dur / W, 0.0, c_dur);
+                g_seekDirty = true; kick();
             }
         }
         break;
@@ -831,7 +894,7 @@ static void onInput(UINT t, WPARAM wp, LPARAM lp) {
         break;
     case WM_RBUTTONDOWN:
         rd = true; rx = x; ry = y; rmode = 0;
-        sB = getd("brightness"); sV = getd("volume"); sPos = getd("time-pos"); sZ = getd("video-zoom");
+        sB = s_bright; sV = s_vol; sPos = c_pos; sZ = s_zoom;
         break;
     case WM_RBUTTONUP: {
         bool click = rd && rmode == 0;
@@ -871,13 +934,24 @@ static void hookIfNeeded() {
         g_vw = (HWND)(intptr_t)id;
         HICON big = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
         HICON sm = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
-        if (big) SendMessageW(g_vw, WM_SETICON, ICON_BIG, (LPARAM)big);
-        if (sm) SendMessageW(g_vw, WM_SETICON, ICON_SMALL, (LPARAM)sm);
+        if (big) PostMessageW(g_vw, WM_SETICON, ICON_BIG, (LPARAM)big);
+        if (sm) PostMessageW(g_vw, WM_SETICON, ICON_SMALL, (LPARAM)sm);
         DWORD tid = GetWindowThreadProcessId(g_vw, 0);
         g_hook = SetWindowsHookExW(WH_GETMESSAGE, HookProc, 0, tid);
     }
 }
 static void wake(void*) { PostMessageW(g_mw, WM_USER + 1, 0, 0); }
+
+// one flush per ~16 ms: applies the latest zoom/pan/seek/OSD instead of one command per input event
+static void flushTick() {
+    DWORD now = GetTickCount();
+    if (g_pending >= 0 && now - g_lastLoad >= 90) doLoad();
+    if (g_viewDirty) { sendView(); g_viewDirty = false; }
+    if (g_seekDirty) { char b[48]; snprintf(b, 48, "%.2f", g_seekTarget); cmd("seek", b, "absolute+keyframes"); g_seekDirty = false; }
+    if (g_osdDirty) { osd(g_osdBuf); g_osdDirty = false; }
+    if (g_inter && !g_viewDirty && now - g_lastView > 200) { g_inter = false; applyQuality(); }   // back to full quality
+    if (g_pending < 0 && !g_viewDirty && !g_seekDirty && !g_osdDirty && !g_inter) KillTimer(g_mw, 2);
+}
 
 static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     if (m >= 0x8000 && m < 0xC000) { onInput(m - 0x8000, wp, lp); return 0; }
@@ -886,6 +960,19 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             mpv_event* e = p_mpv_wait_event(h, 0);
             if (e->event_id == MPV_EVENT_NONE) break;
             if (e->event_id == MPV_EVENT_SHUTDOWN) { PostQuitMessage(0); return 0; }
+            if (e->event_id == MPV_EVENT_PROPERTY_CHANGE && e->data) {
+                mpv_event_property* p = (mpv_event_property*)e->data;
+                if (p->format == MPV_FORMAT_DOUBLE) {
+                    double v = *(double*)p->data;
+                    if (!strcmp(p->name, "time-pos")) c_pos = v; else if (!strcmp(p->name, "duration")) c_dur = v;
+                } else if (p->format == MPV_FORMAT_FLAG) {
+                    int v = *(int*)p->data;
+                    if (!strcmp(p->name, "pause")) c_pause = v != 0; else if (!strcmp(p->name, "eof-reached")) c_eof = v != 0;
+                } else if (p->format == MPV_FORMAT_NONE) {
+                    if (!strcmp(p->name, "duration")) c_dur = 0; else if (!strcmp(p->name, "time-pos")) c_pos = 0;
+                    else if (!strcmp(p->name, "eof-reached")) c_eof = false;
+                }
+            }
             if (e->event_id == MPV_EVENT_FILE_LOADED || e->event_id == MPV_EVENT_VIDEO_RECONFIG) {
                 hookIfNeeded();
                 g_shown = idx;
@@ -899,10 +986,11 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (m == WM_TIMER) {
+        if (wp == 2) { flushTick(); return 0; }
         hookIfNeeded();
         overlay();
         static DWORD lastAuto;
-        if (o_autonext && g_isVid && idx < (int)files.size() - 1 && GetTickCount() - lastAuto > 1500 && isYes("eof-reached")) {
+        if (o_autonext && g_isVid && idx < (int)files.size() - 1 && GetTickCount() - lastAuto > 1500 && c_eof) {
             lastAuto = GetTickCount();
             go(1);
         }
@@ -983,7 +1071,7 @@ static LRESULT CALLBACK SetProc(HWND hw, UINT m, WPARAM wp, LPARAM lp) {
             } else {
                 HWND l = CreateWindowExW(0, L"STATIC", o.lbl, WS_CHILD, S(30), y[pg] + S(3), S(400), S(22), hw, 0, g_inst, 0);
                 wchar_t v[32];
-                if (o.type == 1) _snwprintf(v, 32, L"%d", *(int*)o.p); else wcsncpy(v, (wchar_t*)o.p, 31), v[31] = 0;
+                if (o.type == 1) _snwprintf(v, 32, L"%d", *(int*)o.p); else { wcsncpy(v, (wchar_t*)o.p, 31); v[31] = 0; }
                 c = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", v, WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP | (o.type == 1 ? ES_NUMBER : 0), S(440), y[pg], S(110), S(24), hw, (HMENU)(INT_PTR)(2000 + i), g_inst, 0);
                 g_pg[pg].push_back(l); g_pg[pg].push_back(c);
             }
@@ -1040,9 +1128,6 @@ static LRESULT CALLBACK SetProc(HWND hw, UINT m, WPARAM wp, LPARAM lp) {
                 if (o.type == 1) *(int*)o.p = _wtoi(v); else { wcsncpy((wchar_t*)o.p, v, 15); ((wchar_t*)o.p)[15] = 0; }
             } else return 0;
             applyRuntime();
-            if (g_vw) {
-                if (o_ontop) setp("ontop", "yes"); else setp("ontop", "no");
-            }
             saveSettings();
         }
         return 0;
@@ -1115,10 +1200,12 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     HMODULE dll = LoadLibraryExW(exe, 0, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!dll) { MessageBoxW(0, L"libmpv-2.dll not found next to LiteView.exe", L"LiteView", MB_ICONERROR); return 1; }
 #define L(n) p_##n = (n##_t)GetProcAddress(dll, #n)
-    L(mpv_create); L(mpv_initialize); L(mpv_set_option_string); L(mpv_set_property_string); L(mpv_get_property_string);
-    L(mpv_get_property); L(mpv_command); L(mpv_wait_event); L(mpv_set_wakeup_callback); L(mpv_terminate_destroy); L(mpv_free);
+    L(mpv_create); L(mpv_initialize); L(mpv_set_option_string); L(mpv_get_property_string); L(mpv_get_property);
+    L(mpv_command_async); L(mpv_set_property_async); L(mpv_observe_property); L(mpv_wait_event);
+    L(mpv_set_wakeup_callback); L(mpv_terminate_destroy); L(mpv_free);
 
     loadSettings();
+    s_vol = std::clamp(o_vol, 0, 130);
     wchar_t full[MAX_PATH * 2];
     GetFullPathNameW(argv[1], MAX_PATH * 2, full, 0);
     scan(full);
@@ -1141,7 +1228,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
         {"dscale", o_hq ? "mitchell" : "hermite"},               // downscaling
         {"correct-downscaling", "yes"}, {"linear-downscaling", "yes"}, {"sigmoid-upscaling", "yes"},
         {"icc-profile-auto", "yes"},
-        {"deband", "no"}, {"deband-iterations", "1"},            // per-file mode switching sets these again
+        {"deband", "no"}, {"deband-iterations", "1"},
         {"interpolation", "no"}, {"tscale", "oversample"}, {"video-sync", "audio"},
         // --- window / ui ---
         {"osc", "no"}, {"osd-bar", "no"}, {"input-default-bindings", "no"}, {"input-builtin-bindings", "no"},
@@ -1159,6 +1246,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     if (o_alang[0]) p_mpv_set_option_string(h, "alang", U8(o_alang).c_str());
     p_mpv_set_wakeup_callback(h, wake, 0);
     p_mpv_initialize(h);
+    p_mpv_observe_property(h, 0, "pause", MPV_FORMAT_FLAG);
+    p_mpv_observe_property(h, 0, "eof-reached", MPV_FORMAT_FLAG);
+    p_mpv_observe_property(h, 0, "duration", MPV_FORMAT_DOUBLE);
+    p_mpv_observe_property(h, 0, "time-pos", MPV_FORMAT_DOUBLE);
     if (o_preload && files.size() > 1) {
         g_preEv = CreateEventW(0, FALSE, FALSE, 0);
         CreateThread(0, 0, preloadThread, 0, 0, 0);
@@ -1173,7 +1264,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
         DispatchMessageW(&msg);
     }
     if (g_hook) UnhookWindowsHookEx(g_hook);
-    if (o_remvol) o_vol = (int)getd("volume", o_vol);
+    if (o_remvol) o_vol = (int)floor(s_vol + 0.5);
     saveSettings();
     p_mpv_terminate_destroy(h);
     return 0;
