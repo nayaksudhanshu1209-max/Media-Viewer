@@ -37,6 +37,14 @@ static std::vector<std::wstring> files;
 static int idx;
 static bool g_isVid;
 static DWORD g_ui;                // overlay visible until this tick
+static int g_shown = -1;          // index of the file actually on screen (title follows this, not idx)
+static bool g_fixed;              // window size locked after first file
+static double hAcc, sAcc, swipeThr = 300;
+static DWORD lastH, navCool, tpUntil;
+static int invSwipe;
+static volatile LONG g_preIdx = -1;   // file being viewed; preload thread warms its neighbours
+static HANDLE g_preEv;
+static int g_preload = 1;
 static bool g_ov;
 static std::string KM[256];       // vk -> action
 
@@ -112,6 +120,51 @@ static void go(int d) {
     if (n > 1) openIdx(((idx + d) % n + n) % n);
 }
 
+// ---------- neighbour preload ----------
+// Low-priority background thread that reads the next/previous files into the Windows file cache
+// (photos: first 32 MB; videos: first 4 MB + last 2 MB for MP4 index). The data lives in the OS cache,
+// not in this process, so Windows can drop it any time memory is needed.
+static DWORD WINAPI preloadThread(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);   // also lowers disk priority
+    char* buf = (char*)VirtualAlloc(0, 1 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    std::vector<char> warm(files.size(), 0);
+    static const int order[] = {1, -1, 2, -2};
+    for (;;) {
+        WaitForSingleObject(g_preEv, INFINITE);
+    again:
+        int base = (int)g_preIdx, n = (int)files.size();
+        if (base < 0 || n < 2) continue;
+        for (int k = 0; k < 4; k++) {
+            int i = ((base + order[k]) % n + n) % n;
+            if (i == base || warm[i]) continue;
+            HANDLE f = CreateFileW(files[i].c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0,
+                                   OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, 0);
+            if (f == INVALID_HANDLE_VALUE) continue;
+            LARGE_INTEGER sz = {};
+            GetFileSizeEx(f, &sz);
+            bool vid = !isImg(std::wstring(PathFindExtensionW(files[i].c_str())));
+            long long head = vid ? (4LL << 20) : (32LL << 20), done = 0;
+            DWORD got = 0;
+            bool abort = false;
+            while (done < head && done < sz.QuadPart) {
+                if (!ReadFile(f, buf, 1 << 20, &got, 0) || !got) break;
+                done += got;
+                if (base != (int)g_preIdx) { abort = true; break; }     // user moved on: restart from new position
+            }
+            if (!abort && vid && sz.QuadPart > head + (2LL << 20)) {
+                LARGE_INTEGER p; p.QuadPart = sz.QuadPart - (2LL << 20);
+                SetFilePointerEx(f, p, 0, FILE_BEGIN);
+                ReadFile(f, buf, 1 << 20, &got, 0);
+                ReadFile(f, buf, 1 << 20, &got, 0);
+            }
+            CloseHandle(f);
+            if (abort) goto again;
+            warm[i] = 1;
+        }
+    }
+    return 0;
+}
+
 // ---------- shortcuts (%APPDATA%\LiteView\keys.ini) ----------
 static const char* DEF =
     "; LiteView shortcuts.  Format:  Key=action   (save the file, then reopen the viewer)\r\n"
@@ -124,7 +177,11 @@ static const char* DEF =
     "Space=pause\r\nK=pause\r\nUp=volup\r\nDown=voldown\r\nM=mute\r\nF=fullscreen\r\nEnter=fullscreen\r\n"
     "J=seekback\r\nL=seekfwd\r\nPeriod=framenext\r\nComma=frameback\r\nR=rotate\r\n"
     "Plus=zoomin\r\nMinus=zoomout\r\n0=zoomreset\r\nB=brightup\r\nV=brightdown\r\n"
-    "RBracket=speedup\r\nLBracket=speeddown\r\nBackspace=speedreset\r\nI=info\r\nS=settings\r\nF1=settings\r\n";
+    "RBracket=speedup\r\nLBracket=speeddown\r\nBackspace=speedreset\r\nI=info\r\nS=settings\r\nF1=settings\r\n"
+    "\r\n; Touchpad: two-finger horizontal swipe = next/prev photo (seek in video), pinch = zoom,\r\n"
+    "; two-finger scroll = pan when zoomed. invert_swipe=1 flips swipe direction.\r\n"
+    "; preload=1 warms the next/previous files in the background (0 = off).\r\n"
+    "[options]\r\ninvert_swipe=0\r\nswipe_distance=300\r\npreload=1\r\n";
 
 static void cfgPath(wchar_t* p) {
     SHGetFolderPathW(0, CSIDL_APPDATA, 0, 0, p);
@@ -155,6 +212,9 @@ static void loadKeys() {
         if (f) { fputs(DEF, f); fclose(f); }
     }
     static wchar_t buf[8192];
+    invSwipe = GetPrivateProfileIntW(L"options", L"invert_swipe", 0, p);
+    g_preload = GetPrivateProfileIntW(L"options", L"preload", 1, p);
+    swipeThr = std::max(60, (int)GetPrivateProfileIntW(L"options", L"swipe_distance", 300, p));
     GetPrivateProfileSectionW(L"keys", buf, 8192, p);
     for (wchar_t* s = buf; *s; s += wcslen(s) + 1) {
         wchar_t* eq = wcschr(s, L'=');
@@ -215,10 +275,12 @@ static void overlay() {
     if (W < 80 || H < 80) return;
     static char buf[2048];
     int n = 0, fs = std::max(18, H / 38), m = W * 4 / 100;
-    std::string nm = U8(PathFindFileNameW(files[idx].c_str()));
+    int si = g_shown;
+    if (si < 0 || si >= (int)files.size()) return;
+    std::string nm = U8(PathFindFileNameW(files[si].c_str()));
     for (auto& c : nm) if (c == '{' || c == '}') c = '('; else if (c == '\\') c = '/';
     n += snprintf(buf + n, sizeof(buf) - n, "{\\an7\\pos(%d,%d)\\fs%d\\bord2\\shad0\\1c&HFFFFFF&\\3c&H000000&\\3a&H60&}%s   %d/%d",
-                  m, m / 2, fs, nm.c_str(), idx + 1, (int)files.size());
+                  m, m / 2, fs, nm.c_str(), si + 1, (int)files.size());
     double dur = g_isVid ? getd("duration") : 0;
     if (dur > 0) {
         double pos = getd("time-pos"), f = std::clamp(pos / dur, 0.0, 1.0);
@@ -239,6 +301,77 @@ static bool ld, rd, md, skipClick;
 static int dx0, dy0, rx, ry, rmode, mx, my;
 static DWORD lastDown;
 static double sB, sV, sPos, sZ;
+
+// zoom keeping the point under (x,y) roughly fixed; returns the new zoom (log2)
+static double zoomAt(double nz, int x, int y, int W, int H) {
+    nz = std::clamp(nz, -1.0, 6.0);
+    double z0 = getd("video-zoom");
+    if (nz <= 0.001) {
+        setd("video-zoom", nz); setp("video-pan-x", "0"); setp("video-pan-y", "0");
+        return nz;
+    }
+    double s = pow(2.0, nz - z0), zf = pow(2.0, z0);
+    double kx = (x - W / 2.0) / (W * zf) * (1.0 / s - 1.0);
+    double ky = (y - H / 2.0) / (H * zf) * (1.0 / s - 1.0);
+    setd("video-pan-x", std::clamp(getd("video-pan-x") + kx, -3.0, 3.0));
+    setd("video-pan-y", std::clamp(getd("video-pan-y") + ky, -3.0, 3.0));
+    setd("video-zoom", nz);
+    return nz;
+}
+
+// Mouse wheel AND precision-touchpad gestures. Touchpads send small fractional deltas
+// (not multiples of 120) and horizontal scroll; everything is accumulated, nothing is rounded away.
+static void onWheel(UINT t, WPARAM wp, LPARAM lp) {
+    int raw = GET_WHEEL_DELTA_WPARAM(wp);
+    if (!raw || !g_vw) return;
+    DWORD now = GetTickCount();
+    if (raw % 120) tpUntil = now + 600;          // fractional delta => touchpad
+    bool tp = now < tpUntil;
+    double d = raw / 120.0;
+    POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    ScreenToClient(g_vw, &pt);
+    RECT r; GetClientRect(g_vw, &r);
+    int W = std::max<int>(1, r.right), H = std::max<int>(1, r.bottom);
+    bool ctrl = (LOWORD(wp) & MK_CONTROL) || GetKeyState(VK_CONTROL) < 0;   // pinch arrives as Ctrl+wheel
+    bool shift = (LOWORD(wp) & MK_SHIFT) != 0;
+    double z = getd("video-zoom"), zf = pow(2.0, z);
+    char b[96];
+
+    if (t == WM_MOUSEHWHEEL) {                   // two-finger horizontal swipe
+        if (z > 0.01) {                          // zoomed in: pan
+            setd("video-pan-x", std::clamp(getd("video-pan-x") - d * 100.0 / (W * zf), -3.0, 3.0));
+            return;
+        }
+        if (invSwipe) d = -d;
+        if (!g_isVid) {                          // photo: swipe to next / previous
+            if (now - lastH > 250) hAcc = 0;
+            lastH = now;
+            if (now < navCool) { navCool = now + 250; return; }   // swallow inertia after a swipe
+            hAcc += d * 120;
+            if (fabs(hAcc) > swipeThr) { go(hAcc > 0 ? 1 : -1); hAcc = 0; navCool = now + 450; }
+        } else {                                 // video: swipe to scrub
+            sAcc += d * 5;
+            if (fabs(sAcc) >= 1) { snprintf(b, 96, "%.2f", sAcc); cmd("seek", b, "relative+keyframes"); sAcc = 0; }
+        }
+        return;
+    }
+    if (ctrl) {                                  // pinch (or Ctrl+wheel): smooth zoom toward the cursor
+        double nz = zoomAt(z + 0.2 * d, pt.x, pt.y, W, H);
+        snprintf(b, 96, "Zoom %d%%", (int)(100 * pow(2.0, nz))); osd(b);
+        return;
+    }
+    if (!tp) {                                   // classic mouse wheel
+        if (!g_isVid) {
+            double nz = zoomAt(z + 0.15 * d, pt.x, pt.y, W, H);
+            snprintf(b, 96, "Zoom %d%%", (int)(100 * pow(2.0, nz))); osd(b);
+        } else if (shift) { snprintf(b, 96, "%d", (int)(d * 5)); cmd("seek", b); }
+        else { setd("volume", std::clamp(getd("volume") + d * 5, 0.0, 130.0)); osd("Volume ${volume}%"); }
+        return;
+    }
+    // two-finger vertical scroll on a touchpad
+    if (z > 0.01) setd("video-pan-y", std::clamp(getd("video-pan-y") + d * 100.0 / (H * zf), -3.0, 3.0));
+    else if (g_isVid) { setd("volume", std::clamp(getd("volume") + d * 3, 0.0, 130.0)); osd("Volume ${volume}%"); }
+}
 
 static void onInput(UINT t, WPARAM wp, LPARAM lp) {
     if (!g_vw) return;
@@ -308,18 +441,11 @@ static void onInput(UINT t, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONUP: rd = false; break;
     case WM_MBUTTONDOWN: md = true; mx = x; my = y; break;
     case WM_MBUTTONUP: md = false; break;
-    case WM_MOUSEWHEEL: {
-        int d = GET_WHEEL_DELTA_WPARAM(wp) / 120;
-        if (!d) break;
-        if ((LOWORD(wp) & MK_CONTROL) || !g_isVid) {
-            double z = std::clamp(getd("video-zoom") + 0.15 * d, -1.0, 6.0);
-            setd("video-zoom", z);
-            snprintf(b, 96, "Zoom %d%%", (int)(100 * pow(2.0, z))); osd(b);
-        } else if (LOWORD(wp) & MK_SHIFT) { snprintf(b, 96, "%d", d * 5); cmd("seek", b); }
-        else { snprintf(b, 96, "%d", d * 5); cmd("add", "volume", b); osd("Volume ${volume}%"); }
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+        onWheel(t, wp, lp);
         showUI();
         break;
-    }
     }
 }
 
@@ -328,7 +454,7 @@ static LRESULT CALLBACK HookProc(int c, WPARAM wp, LPARAM lp) {
         MSG* m = (MSG*)lp;
         UINT t = m->message;
         if (t == WM_KEYDOWN || t == WM_MOUSEMOVE || t == WM_LBUTTONDOWN || t == WM_LBUTTONUP || t == WM_RBUTTONDOWN ||
-            t == WM_RBUTTONUP || t == WM_MBUTTONDOWN || t == WM_MBUTTONUP || t == WM_MOUSEWHEEL)
+            t == WM_RBUTTONUP || t == WM_MBUTTONDOWN || t == WM_MBUTTONUP || t == WM_MOUSEWHEEL || t == WM_MOUSEHWHEEL)
             PostMessageW(g_mw, 0x8000 + t, m->wParam, m->lParam);
     }
     return CallNextHookEx(0, c, wp, lp);
@@ -353,7 +479,15 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             mpv_event* e = p_mpv_wait_event(h, 0);
             if (e->event_id == MPV_EVENT_NONE) break;
             if (e->event_id == MPV_EVENT_SHUTDOWN) { PostQuitMessage(0); return 0; }
-            if (e->event_id == MPV_EVENT_FILE_LOADED || e->event_id == MPV_EVENT_VIDEO_RECONFIG) hookIfNeeded();
+            if (e->event_id == MPV_EVENT_FILE_LOADED || e->event_id == MPV_EVENT_VIDEO_RECONFIG) {
+                hookIfNeeded();
+                g_shown = idx;
+                if (g_preload && g_preEv && g_preIdx != idx) { g_preIdx = idx; SetEvent(g_preEv); }
+                if (!g_fixed && e->event_id == MPV_EVENT_VIDEO_RECONFIG) {
+                    g_fixed = true;                       // stop mpv resizing the window for every new file
+                    setp("auto-window-resize", "no");     // -> no stretch/jump, new file just fills the same window
+                }
+            }
         }
         return 0;
     }
@@ -402,6 +536,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     for (auto& kv : o) p_mpv_set_option_string(h, kv[0], kv[1]);
     p_mpv_set_wakeup_callback(h, wake, 0);
     p_mpv_initialize(h);
+    if (g_preload && files.size() > 1) {
+        g_preEv = CreateEventW(0, FALSE, FALSE, 0);
+        CreateThread(0, 0, preloadThread, 0, 0, 0);
+    }
     openIdx(idx);
     SetTimer(g_mw, 1, 120, 0);
 
