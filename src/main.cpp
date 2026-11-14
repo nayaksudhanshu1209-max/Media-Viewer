@@ -82,13 +82,13 @@ static double getd(const char* n, double d = 0) {
     double v;
     return p_mpv_get_property(h, n, MPV_FORMAT_DOUBLE, &v) >= 0 ? v : d;
 }
-static std::string gets(const char* n) {
+static std::string mgets(const char* n) {
     char* s = p_mpv_get_property_string(h, n);
     std::string r = s ? s : "";
     if (s) p_mpv_free(s);
     return r;
 }
-static bool isYes(const char* n) { return gets(n) == "yes"; }
+static bool isYes(const char* n) { return mgets(n) == "yes"; }
 static void osd(const char* s) { cmd("show-text", s, "1000"); }
 static void showUI() { g_ui = GetTickCount() + std::max(1, o_uisec) * 1000; }
 
@@ -354,15 +354,15 @@ static void addStr(HMENU m, UINT id, const wchar_t* t, bool chk = false, bool di
     AppendMenuW(m, MF_STRING | (chk ? MF_CHECKED : 0) | (dis ? MF_GRAYED : 0), id, t);
 }
 static void addTracks(HMENU m, const char* type, int base) {
-    int n = atoi(gets("track-list/count").c_str()), added = 0;
+    int n = atoi(mgets("track-list/count").c_str()), added = 0;
     char k[64];
     for (int i = 0; i < n; i++) {
         snprintf(k, 64, "track-list/%d/type", i);
-        if (gets(k) != type) continue;
-        snprintf(k, 64, "track-list/%d/id", i); int id = atoi(gets(k).c_str());
-        snprintf(k, 64, "track-list/%d/lang", i); std::string lang = gets(k);
-        snprintf(k, 64, "track-list/%d/title", i); std::string ti = gets(k);
-        snprintf(k, 64, "track-list/%d/selected", i); bool sel = gets(k) == "yes";
+        if (mgets(k) != type) continue;
+        snprintf(k, 64, "track-list/%d/id", i); int id = atoi(mgets(k).c_str());
+        snprintf(k, 64, "track-list/%d/lang", i); std::string lang = mgets(k);
+        snprintf(k, 64, "track-list/%d/title", i); std::string ti = mgets(k);
+        snprintf(k, 64, "track-list/%d/selected", i); bool sel = mgets(k) == "yes";
         std::wstring lb = std::to_wstring(id) + L": " + Wd(lang.empty() ? std::string("unknown") : lang) + (ti.empty() ? std::wstring() : L"   " + Wd(ti));
         AppendMenuW(m, MF_STRING | (sel ? MF_CHECKED : 0), base + id, lb.c_str());
         added++;
@@ -371,7 +371,7 @@ static void addTracks(HMENU m, const char* type, int base) {
 }
 static HMENU menuSubs() {
     HMENU m = CreatePopupMenu();
-    addStr(m, M_SUBOFF, L"Off", gets("sid") == "no");
+    addStr(m, M_SUBOFF, L"Off", mgets("sid") == "no");
     addTracks(m, "sub", 2000);
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
     addStr(m, M_SUBLOAD, L"Load subtitle file...");
@@ -416,7 +416,7 @@ static HMENU menuContext() {
         AppendMenuW(m, MF_POPUP, (UINT_PTR)menuAudio(), L"Audio");
         AppendMenuW(m, MF_POPUP, (UINT_PTR)menuSubs(), L"Subtitles");
         AppendMenuW(m, MF_POPUP, (UINT_PTR)menuAspect(), L"Aspect ratio");
-        addStr(m, M_LOOP, L"Loop", gets("loop-file") == "inf");
+        addStr(m, M_LOOP, L"Loop", mgets("loop-file") == "inf");
     }
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
     addStr(m, M_ZRESET, L"Reset zoom\t0"); addStr(m, M_ROTATE, L"Rotate\tR");
