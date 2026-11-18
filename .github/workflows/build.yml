@@ -22,8 +22,10 @@ jobs:
         shell: bash
         run: |
           windres app.rc -O coff -o app.o
-          g++ -std=c++17 -Os -s -mwindows -municode -static -Idev/include \
+          g++ -std=c++17 -O2 -s -ffunction-sections -fdata-sections -Wl,--gc-sections \
+              -mwindows -municode -static -Idev/include \
               -o LiteView.exe src/main.cpp app.o \
+              -lwindowscodecs -lole32 -luuid -loleaut32 \
               -lcomctl32 -lcomdlg32 -lshlwapi -lshell32 -luser32 -lgdi32 -ladvapi32
 
       - name: Package
