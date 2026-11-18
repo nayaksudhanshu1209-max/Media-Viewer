@@ -28,7 +28,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <memory>
+#include <wincodec.h>
 #include <mpv/client.h>
+#include <mpv/stream_cb.h>
 
 // ======================= libmpv (dynamic) =======================
 #define F(ret, name, args) typedef ret (*name##_t) args; static name##_t p_##name;
@@ -44,6 +47,7 @@ F(mpv_event*, mpv_wait_event, (mpv_handle*, double))
 F(void, mpv_set_wakeup_callback, (mpv_handle*, void (*)(void*), void*))
 F(void, mpv_terminate_destroy, (mpv_handle*))
 F(void, mpv_free, (void*))
+F(int, mpv_stream_cb_add_ro, (mpv_handle*, const char*, void*, mpv_stream_cb_open_ro_fn))
 
 static mpv_handle* h;
 static HINSTANCE g_inst;
@@ -142,15 +146,38 @@ static bool extIn(std::wstring e, const wchar_t* const* L_, int n) {
     for (int i = 0; i < n; i++) if (e == L_[i]) return true;
     return false;
 }
-static bool isImg(const std::wstring& e) {
-    static const wchar_t* const L_[] = {L".jpg", L".jpeg", L".png", L".gif", L".webp", L".bmp", L".tif", L".tiff", L".avif", L".jxl", L".ico", L".jfif", L".apng"};
-    return extIn(e, L_, sizeof(L_) / sizeof(*L_));
+#define CNT(a) ((int)(sizeof(a) / sizeof(*(a))))
+// Photos handled by mpv/FFmpeg
+static const wchar_t* const EXT_IMG[] = {L".jpg", L".jpeg", L".jpe", L".jfif", L".jif", L".png", L".apng", L".gif", L".webp", L".bmp", L".dib",
+    L".tif", L".tiff", L".avif", L".jxl", L".ico", L".cur", L".tga", L".pcx", L".pbm", L".pgm", L".ppm", L".pnm", L".pam", L".pfm",
+    L".xbm", L".xpm", L".sgi", L".ras", L".xwd", L".exr", L".hdr", L".dds", L".psd", L".jp2", L".j2k", L".jpf", L".jpx", L".qoi",
+    L".dpx", L".fits"};
+// Photos decoded through Windows' own codecs (WIC): HEIC/HEIF, JPEG XR, camera RAW (needs the matching Windows codec extension)
+static const wchar_t* const EXT_WIC[] = {L".heic", L".heif", L".hif", L".jxr", L".wdp", L".hdp", L".dng", L".cr2", L".cr3", L".crw", L".nef",
+    L".nrw", L".arw", L".srf", L".sr2", L".raf", L".orf", L".rw2", L".rwl", L".pef", L".srw", L".x3f", L".3fr", L".erf", L".kdc", L".dcr",
+    L".mrw", L".mef", L".mos", L".iiq"};
+static const wchar_t* const EXT_VID[] = {L".mp4", L".m4v", L".mp4v", L".mkv", L".mk3d", L".webm", L".avi", L".mov", L".qt", L".wmv", L".asf",
+    L".flv", L".f4v", L".mts", L".m2ts", L".m2t", L".tp", L".trp", L".mpg", L".mpeg", L".mpe", L".m2v", L".vob", L".ogv", L".ogm",
+    L".3gp", L".3g2", L".3gpp", L".divx", L".xvid", L".rm", L".rmvb", L".hevc", L".h265", L".265", L".h264", L".264", L".avc", L".mxf",
+    L".dv", L".wtv", L".dvr-ms", L".nsv", L".y4m", L".ivf", L".mjpeg", L".mjpg", L".vc1", L".amv", L".swf", L".evo", L".bik", L".smk"};
+static const wchar_t* const EXT_AUD[] = {L".mp3", L".flac", L".wav", L".ogg", L".oga", L".opus", L".m4a", L".aac", L".wma", L".ape", L".wv",
+    L".aiff", L".aif", L".alac", L".mka", L".ac3", L".dts", L".mp2", L".mpc", L".tta", L".caf"};
+static bool isWicPrimary(const std::wstring& e) { return extIn(e, EXT_WIC, CNT(EXT_WIC)); }
+static bool isImg(const std::wstring& e) { return extIn(e, EXT_IMG, CNT(EXT_IMG)) || isWicPrimary(e); }
+static bool isVidExt(const std::wstring& e) { return extIn(e, EXT_VID, CNT(EXT_VID)) || extIn(e, EXT_AUD, CNT(EXT_AUD)); }
+static const std::wstring& mediaFilter() {            // file-open dialog filter built from the same tables
+    static std::wstring f;
+    if (f.empty()) {
+        std::wstring all;
+        auto add = [&](const wchar_t* const* L_, int n) { for (int i = 0; i < n; i++) { all += L"*"; all += L_[i]; all += L";"; } };
+        add(EXT_IMG, CNT(EXT_IMG)); add(EXT_WIC, CNT(EXT_WIC)); add(EXT_VID, CNT(EXT_VID)); add(EXT_AUD, CNT(EXT_AUD));
+        if (!all.empty()) all.pop_back();
+        f = L"Photos, videos and audio"; f.push_back(0); f += all; f.push_back(0);
+        f += L"All files"; f.push_back(0); f += L"*.*"; f.push_back(0);
+    }
+    return f;
 }
-static bool isVidExt(const std::wstring& e) {
-    static const wchar_t* const L_[] = {L".mp4", L".mkv", L".avi", L".mov", L".wmv", L".webm", L".flv", L".m4v", L".ts", L".mpg", L".mpeg", L".3gp", L".m2ts", L".ogv", L".vob"};
-    return extIn(e, L_, sizeof(L_) / sizeof(*L_));
-}
-static void scan(const std::wstring& file) {         // fills `files`, sets idx (caller holds g_fl if needed)
+static void scanInto(const std::wstring& file, std::vector<std::wstring>& v, int& ix) {
     wchar_t dir[MAX_PATH * 2];
     wcsncpy(dir, file.c_str(), MAX_PATH * 2 - 1);
     PathRemoveFileSpecW(dir);
@@ -161,14 +188,31 @@ static void scan(const std::wstring& file) {         // fills `files`, sets idx 
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             std::wstring e = PathFindExtensionW(fd.cFileName);
-            if (isImg(e) || isVidExt(e)) files.push_back(std::wstring(dir) + L"\\" + fd.cFileName);
+            if (isImg(e) || isVidExt(e)) v.push_back(std::wstring(dir) + L"\\" + fd.cFileName);
         } while (FindNextFileW(f, &fd));
         FindClose(f);
     }
-    std::sort(files.begin(), files.end(), [](const std::wstring& a, const std::wstring& b) { return StrCmpLogicalW(a.c_str(), b.c_str()) < 0; });
-    idx = -1;
-    for (size_t i = 0; i < files.size(); i++) if (!lstrcmpiW(files[i].c_str(), file.c_str())) idx = (int)i;
-    if (idx < 0) { files.push_back(file); idx = (int)files.size() - 1; }
+    std::sort(v.begin(), v.end(), [](const std::wstring& a, const std::wstring& b) { return StrCmpLogicalW(a.c_str(), b.c_str()) < 0; });
+    ix = -1;
+    for (size_t i = 0; i < v.size(); i++) if (!lstrcmpiW(v[i].c_str(), file.c_str())) ix = (int)i;
+    if (ix < 0) { v.push_back(file); ix = (int)v.size() - 1; }
+}
+static void scan(const std::wstring& file) { scanInto(file, files, idx); }
+
+// At start-up only the opened file is known; the folder is scanned on a worker thread AFTER the first frame is shown.
+static std::wstring g_full;
+static bool g_scanPending;
+static volatile LONG g_scanTok;
+struct ScanJob { std::wstring file; int token; };
+struct ScanRes { std::vector<std::wstring> v; int ix; int token; };
+static DWORD WINAPI scanThread(LPVOID p) {
+    ScanJob* j = (ScanJob*)p;
+    ScanRes* r = new ScanRes;
+    r->token = j->token; r->ix = 0;
+    scanInto(j->file, r->v, r->ix);
+    PostMessageW(g_mw, WM_USER + 3, 0, (LPARAM)r);
+    delete j;
+    return 0;
 }
 
 // ======================= quality / per-mode settings =======================
@@ -184,10 +228,12 @@ static void applyMode(bool vid) {
         setp("interpolation", o_smooth ? "yes" : "no");
         setp("video-sync", o_smooth ? "display-resample" : "audio");
         setp("tscale", "oversample");
+        setp("vd-lavc-threads", "0");
         setp("deband", o_deband ? "yes" : "no");
     } else {                                                  // still images: exact pixels, no motion tricks
         setp("interpolation", "no");
         setp("video-sync", "audio");
+        setp("vd-lavc-threads", "1");               // a single still needs no decoder threads (saves memory + start-up)
         setp("deband", "no");
     }
 }
@@ -207,11 +253,114 @@ static void setVol(double v) { s_vol = std::clamp(v, 0.0, 130.0); setd("volume",
 static void setBright(double v) { s_bright = std::clamp(v, -100.0, 100.0); setd("brightness", s_bright); }
 static void setSpeed(double v) { s_speed = std::clamp(floor(v * 100 + 0.5) / 100, 0.1, 8.0); setd("speed", s_speed); }
 
+// ======================= Windows codec route (HEIC, RAW, JPEG XR, fallback) =======================
+// Decoded on a worker thread to a 24-bit BMP held in memory, then served to mpv via a custom "lvmem://" stream.
+struct Blob { std::vector<unsigned char> d; };
+static CRITICAL_SECTION g_bl;
+static std::vector<std::pair<int, std::shared_ptr<Blob>>> g_blobList;
+static int g_blobSeq;
+static int addBlob(std::shared_ptr<Blob> b) {
+    EnterCriticalSection(&g_bl);
+    int id = ++g_blobSeq;
+    g_blobList.clear();                               // only the newest picture is kept
+    g_blobList.push_back({id, b});
+    LeaveCriticalSection(&g_bl);
+    return id;
+}
+struct Cur { std::shared_ptr<Blob> b; int64_t pos; };
+static int64_t sc_read(void* c, char* buf, uint64_t n) {
+    Cur* k = (Cur*)c;
+    int64_t left = (int64_t)k->b->d.size() - k->pos;
+    if (left <= 0) return 0;
+    int64_t m = std::min<int64_t>(left, (int64_t)n);
+    memcpy(buf, k->b->d.data() + k->pos, (size_t)m);
+    k->pos += m;
+    return m;
+}
+static int64_t sc_seek(void* c, int64_t off) {
+    Cur* k = (Cur*)c;
+    if (off < 0 || off > (int64_t)k->b->d.size()) return MPV_ERROR_GENERIC;
+    k->pos = off;
+    return off;
+}
+static int64_t sc_size(void* c) { return (int64_t)((Cur*)c)->b->d.size(); }
+static void sc_close(void* c) { delete (Cur*)c; }
+static int sc_open(void*, char* uri, mpv_stream_cb_info* info) {
+    const char* q = strstr(uri, "://");
+    int id = q ? atoi(q + 3) : 0;
+    std::shared_ptr<Blob> b;
+    EnterCriticalSection(&g_bl);
+    for (auto& e : g_blobList) if (e.first == id) b = e.second;
+    LeaveCriticalSection(&g_bl);
+    if (!b) return MPV_ERROR_LOADING_FAILED;
+    info->cookie = new Cur{b, 0};
+    info->read_fn = sc_read; info->seek_fn = sc_seek; info->size_fn = sc_size; info->close_fn = sc_close; info->cancel_fn = 0;
+    return 0;
+}
+static std::shared_ptr<Blob> wicDecode(const std::wstring& path) {
+    IWICImagingFactory* fac = 0; IWICBitmapDecoder* dec = 0; IWICBitmapFrameDecode* fr = 0;
+    IWICFormatConverter* cv = 0; IWICBitmapFlipRotator* fl = 0;
+    std::shared_ptr<Blob> out;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, 0, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory, (void**)&fac))) return out;
+    do {
+        if (FAILED(fac->CreateDecoderFromFilename(path.c_str(), 0, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) break;
+        if (FAILED(dec->GetFrame(0, &fr))) break;
+        UINT w = 0, h = 0;
+        fr->GetSize(&w, &h);
+        if (!w || !h || (unsigned long long)w * h > 100000000ULL) break;          // up to 100 megapixels
+        if (FAILED(fac->CreateFormatConverter(&cv))) break;
+        if (FAILED(cv->Initialize(fr, GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, 0, 0, WICBitmapPaletteTypeCustom))) break;
+        if (FAILED(fac->CreateBitmapFlipRotator(&fl))) break;                      // BMP rows are stored bottom-up
+        if (FAILED(fl->Initialize(cv, WICBitmapTransformFlipVertical))) break;
+        UINT stride = (w * 3 + 3) & ~3u;
+        size_t pix = (size_t)stride * h;
+        out = std::make_shared<Blob>();
+        out->d.resize(54 + pix);
+        unsigned char* b = out->d.data();
+        memset(b, 0, 54);
+        auto u32 = [&](int o, uint32_t v) { memcpy(b + o, &v, 4); };
+        b[0] = 'B'; b[1] = 'M';
+        u32(2, (uint32_t)(54 + pix)); u32(10, 54); u32(14, 40); u32(18, w); u32(22, h);
+        b[26] = 1; b[28] = 24; u32(34, (uint32_t)pix);
+        if (FAILED(fl->CopyPixels(0, stride, (UINT)pix, b + 54))) out.reset();
+    } while (0);
+    if (fl) fl->Release();
+    if (cv) cv->Release();
+    if (fr) fr->Release();
+    if (dec) dec->Release();
+    fac->Release();
+    return out;
+}
+struct WicJob { std::wstring path; int token, idx; bool fb; };
+struct WicRes { std::shared_ptr<Blob> blob; int token, idx; bool fb; };
+static volatile LONG g_wicToken;
+static int g_wicTried = -1;
+static DWORD WINAPI wicThread(LPVOID p) {
+    WicJob* j = (WicJob*)p;
+    CoInitializeEx(0, COINIT_MULTITHREADED);
+    std::shared_ptr<Blob> b = wicDecode(j->path);
+    CoUninitialize();
+    PostMessageW(g_mw, WM_USER + 2, 0, (LPARAM) new WicRes{b, j->token, j->idx, j->fb});
+    delete j;
+    return 0;
+}
+static void startWic(int i, bool fallback) {
+    g_wicTried = i;
+    g_isVid = false;
+    WicJob* j = new WicJob{files[i], (int)InterlockedIncrement(&g_wicToken), i, fallback};
+    HANDLE t = CreateThread(0, 0, wicThread, j, 0, 0);
+    if (t) CloseHandle(t); else delete j;
+}
+static void showCantOpen() {
+    cmd("show-text", "Can't open this file (missing codec?)\nHEIC / RAW: install the free HEIF, HEVC and RAW image extensions from the Microsoft Store", "6000");
+}
+
 // ======================= loading =======================
 static void doLoad() {
     int i = g_pending; g_pending = -1;
     if (i < 0 || i >= (int)files.size()) return;
     g_lastLoad = GetTickCount();
+    InterlockedIncrement(&g_wicToken);              // drop any decode still running for a previous file
     std::wstring p = files[i];
     std::wstring e = PathFindExtensionW(p.c_str());
     for (auto& c : e) c = towlower(c);
@@ -222,6 +371,7 @@ static void doLoad() {
     if (s_rot) { s_rot = 0; setd("video-rotate", 0); }
     bool lp = (e == L".gif" || e == L".webp" || e == L".apng");
     if (lp != s_loop) { s_loop = lp; setp("loop-file", lp ? "inf" : "no"); }
+    if (isWicPrimary(e)) { startWic(i, false); return; }   // HEIC / RAW / JXR: decode with Windows codecs (old picture stays until ready)
     std::string u = U8(p);
     cmd("loadfile", u.c_str(), "replace");
     setp("pause", "no");
@@ -240,6 +390,7 @@ static void go(int d) {
 static void setFiles(const std::wstring& path) {
     EnterCriticalSection(&g_fl);
     files.clear();
+    InterlockedIncrement(&g_scanTok);
     scan(path);
     InterlockedIncrement(&g_flGen);
     LeaveCriticalSection(&g_fl);
@@ -611,7 +762,7 @@ void menuCmd(int id) {
     switch (id) {
     case M_OPEN: {
         wchar_t f[MAX_PATH * 2];
-        if (pickFile(f, L"Photos and videos\0*.jpg;*.jpeg;*.png;*.gif;*.webp;*.bmp;*.tif;*.tiff;*.avif;*.jxl;*.ico;*.jfif;*.apng;*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.webm;*.flv;*.m4v;*.ts;*.mpg;*.mpeg;*.3gp;*.m2ts;*.ogv;*.vob\0All files\0*.*\0")) setFiles(f);
+        if (pickFile(f, mediaFilter().c_str())) setFiles(f);
         break;
     }
     case M_EXPLORER: {
@@ -1002,8 +1153,22 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
                     else if (!strcmp(p->name, "eof-reached")) c_eof = false;
                 }
             }
+            if (e->event_id == MPV_EVENT_END_FILE && e->data) {
+                mpv_event_end_file* ef = (mpv_event_end_file*)e->data;
+                if (ef->reason == MPV_END_FILE_REASON_ERROR) {
+                    std::wstring ce = (idx >= 0 && idx < (int)files.size()) ? std::wstring(PathFindExtensionW(files[idx].c_str())) : std::wstring();
+                    if (g_wicTried != idx && isImg(ce)) startWic(idx, true);   // mpv could not decode it: try Windows codecs
+                    else showCantOpen();
+                }
+            }
             if (e->event_id == MPV_EVENT_FILE_LOADED || e->event_id == MPV_EVENT_VIDEO_RECONFIG) {
                 hookIfNeeded();
+                if (g_scanPending) {                        // first frame is on screen: now list the folder in the background
+                    g_scanPending = false;
+                    ScanJob* sj = new ScanJob{g_full, (int)InterlockedIncrement(&g_scanTok)};
+                    HANDLE st = CreateThread(0, 0, scanThread, sj, 0, 0);
+                    if (st) CloseHandle(st); else delete sj;
+                }
                 g_shown = idx;
                 if (o_preload && g_preEv && g_preIdx != idx) { g_preIdx = idx; SetEvent(g_preEv); }
                 if (!g_fixed && e->event_id == MPV_EVENT_VIDEO_RECONFIG) {
@@ -1012,6 +1177,35 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
                 }
             }
         }
+        return 0;
+    }
+    if (m == WM_USER + 2) {                       // Windows-codec decode finished
+        WicRes* r = (WicRes*)lp;
+        if (r->token == g_wicToken && r->idx == idx && idx < (int)files.size()) {
+            if (r->blob) {
+                int id = addBlob(r->blob);
+                char u[48]; snprintf(u, 48, "lvmem://%d.bmp", id);
+                cmd("loadfile", u, "replace");
+                setp("pause", "no");
+            } else if (!r->fb) {                        // no Windows codec: still let mpv try (works for simple HEIC)
+                std::string u = U8(files[r->idx]);
+                cmd("loadfile", u.c_str(), "replace");
+                setp("pause", "no");
+            } else showCantOpen();
+        }
+        delete r;
+        return 0;
+    }
+    if (m == WM_USER + 3) {                       // folder listing finished
+        ScanRes* r = (ScanRes*)lp;
+        if (r->token == g_scanTok) {
+            EnterCriticalSection(&g_fl);
+            files.swap(r->v); idx = r->ix;
+            InterlockedIncrement(&g_flGen);
+            LeaveCriticalSection(&g_fl);
+            g_shown = idx;
+        }
+        delete r;
         return 0;
     }
     if (m == WM_TIMER) {
@@ -1219,6 +1413,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     SetProcessDPIAware();
     g_inst = hi;
     InitializeCriticalSection(&g_fl);
+    InitializeCriticalSection(&g_bl);
+    CoInitializeEx(0, COINIT_APARTMENTTHREADED);
     int argc;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argc < 2) {
@@ -1234,13 +1430,13 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
 #define L(n) p_##n = (n##_t)GetProcAddress(dll, #n)
     L(mpv_create); L(mpv_initialize); L(mpv_set_option_string); L(mpv_get_property_string); L(mpv_get_property);
     L(mpv_command_async); L(mpv_set_property_async); L(mpv_observe_property); L(mpv_wait_event);
-    L(mpv_set_wakeup_callback); L(mpv_terminate_destroy); L(mpv_free);
+    L(mpv_set_wakeup_callback); L(mpv_terminate_destroy); L(mpv_free); L(mpv_stream_cb_add_ro);
 
     loadSettings();
     s_vol = std::clamp(o_vol, 0, 130);
     wchar_t full[MAX_PATH * 2];
     GetFullPathNameW(argv[1], MAX_PATH * 2, full, 0);
-    scan(full);
+    files.push_back(full); idx = 0; g_full = full; g_scanPending = true;   // folder is listed after the first frame
 
     WNDCLASSW wc = {};
     wc.lpfnWndProc = MW; wc.hInstance = hi; wc.lpszClassName = L"LiteViewMsg";
@@ -1275,7 +1471,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
         {"osd-font-size", "30"}, {"osd-border-size", "2"}, {"osd-margin-y", "40"},
         {"fullscreen", o_startfs ? "yes" : "no"}, {"ontop", o_ontop ? "yes" : "no"},
         // --- audio / subtitles / memory ---
-        {"volume", vol}, {"volume-max", "130"}, {"audio-display", "no"}, {"save-position-on-quit", "no"},
+        {"volume", vol}, {"volume-max", "130"}, {"audio-display", "embedded-first"}, {"save-position-on-quit", "no"},
         {"sub-auto", "fuzzy"}, {"sub-font-size", sub}, {"sub-border-size", "2"},
         {"demuxer-max-bytes", "32MiB"}, {"demuxer-max-back-bytes", "8MiB"}, {"taskbar-progress", "no"}};
     for (auto& kv : o) p_mpv_set_option_string(h, kv[0], kv[1]);
@@ -1283,16 +1479,17 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     if (o_alang[0]) p_mpv_set_option_string(h, "alang", U8(o_alang).c_str());
     p_mpv_set_wakeup_callback(h, wake, 0);
     p_mpv_initialize(h);
+    if (p_mpv_stream_cb_add_ro) p_mpv_stream_cb_add_ro(h, "lvmem", 0, sc_open);
     p_mpv_observe_property(h, 0, "pause", MPV_FORMAT_FLAG);
     p_mpv_observe_property(h, 0, "eof-reached", MPV_FORMAT_FLAG);
     p_mpv_observe_property(h, 0, "duration", MPV_FORMAT_DOUBLE);
     p_mpv_observe_property(h, 0, "time-pos", MPV_FORMAT_DOUBLE);
-    if (o_preload && files.size() > 1) {
+    if (o_preload) {
         g_preEv = CreateEventW(0, FALSE, FALSE, 0);
         CreateThread(0, 0, preloadThread, 0, 0, 0);
     }
     openIdx(idx);
-    SetTimer(g_mw, 1, 120, 0);
+    SetTimer(g_mw, 1, 200, 0);
 
     MSG msg;
     while (GetMessageW(&msg, 0, 0, 0) > 0) {
