@@ -1400,7 +1400,7 @@ static void onInput(UINT t, WPARAM wp, LPARAM lp) {
         break;
     case WM_LBUTTONDOWN: {
         DWORD now = GetTickCount();
-        skipClick = false; winDrag = false; ld = true; downBtn_reset:
+        skipClick = false; winDrag = false; ld = true;
         g_downKind = 0;
         dx0 = x; dy0 = y; lx = x; ly = y;
         uiBuild(W, H, false);
