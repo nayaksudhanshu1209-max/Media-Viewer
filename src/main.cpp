@@ -1,11 +1,10 @@
 // LiteView - tiny photo/video viewer. Engine: libmpv (loaded at runtime). UI/input/overlay/settings: this file.
 //
 // Performance rules used throughout:
-//  * Never ask mpv for a value on a hot path (it blocks while the core is decoding). The app keeps its own copy of
-//    volume/zoom/pan/etc. and mpv pushes time/pause/duration to us through observed properties.
-//  * All commands/property sets are asynchronous (queued, never waited for).
-//  * Zoom/pan/seek/OSD updates from touchpad or mouse are coalesced into one update per ~16 ms.
-//  * Rapid next/previous only loads the latest target (max ~11 loads per second).
+//  * Never ask mpv for a value on a hot path (it blocks while the core is decoding). The app keeps its own copy of the
+//    values and mpv pushes time/pause/duration to us through observed properties. All commands are asynchronous.
+//  * Zoom/pan/seek/OSD updates are coalesced and rate limited; rapid next/previous only loads the latest target.
+//  * The player UI is drawn as vector shapes through mpv's ASS overlay (no extra windows, no extra libraries).
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -23,12 +22,12 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <memory>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <memory>
 #include <wincodec.h>
 #include <mpv/client.h>
 #include <mpv/stream_cb.h>
@@ -57,16 +56,15 @@ static std::vector<std::wstring> files;
 static CRITICAL_SECTION g_fl;        // guards `files` (preload thread reads it)
 static volatile LONG g_flGen;
 static int idx;
-static bool g_isVid, g_ov;
-static bool g_fixed;
+static bool g_isVid, g_ov, g_fixed;
 static int g_shown = -1;
 static DWORD g_ui;
-static std::string KM[256];          // vk -> action
+static std::string KMS[2][256];      // [0] photo / [1] video : vk -> action
 
 // ---- user options (edited in the Settings window, stored in %APPDATA%\LiteView\keys.ini) ----
 static int o_autonext = 1, o_remvol = 1, o_vol = 100, o_startfs = 0, o_ontop = 0, o_uisec = 2, o_preload = 1;
-static int o_inv = 0, o_swipe = 300, o_hq = 1, o_smooth = 0, o_deband = 0, o_hwdec = 1, o_subsize = 40;
-static int o_ultra = 0, o_icc = 0, o_next = 0;   // ultra = heaviest scaler, icc = colour-managed display, next = gpu-next renderer
+static int o_inv = 0, o_invv = 0, o_swipe = 300, o_hq = 1, o_smooth = 0, o_deband = 0, o_hwdec = 1;
+static int o_ultra = 0, o_icc = 0, o_next = 0, o_stereo = 1, o_resume = 1, o_subpct = 100;
 static wchar_t o_slang[16], o_alang[16];
 
 static volatile LONG g_preIdx = -1;
@@ -74,19 +72,19 @@ static HANDLE g_preEv;
 
 // ---- state we own / cache (no round trips to mpv) ----
 static double c_dur, c_pos;                 // pushed by mpv (observed)
-static bool c_pause, c_eof;                 // pushed by mpv (observed)
-static double s_vol = 100, s_bright, s_zoom, s_px, s_py, s_speed = 1, s_subdelay, s_audiodelay, s_subscale = 1;
+static bool c_pause, c_eof, c_full;         // pushed by mpv (observed)
+static double s_vol = 100, s_bright, s_contrast, s_sat, s_zoom, s_px, s_py, s_speed = 1, s_subdelay, s_audiodelay, s_subscale = 1;
 static int s_rot;
 static bool s_mute, s_loop;
 static bool g_viewDirty, g_osdDirty, g_seekDirty;
-static double g_tView, g_tSeek, g_tOsd, g_tOv;
-static volatile LONG g_mmPending;            // coalesced mouse-move from the hook thread
+static double g_tView, g_tSeek, g_tOsd, g_tOv, g_seekTarget;
+static volatile LONG g_mmPending;           // coalesced mouse-move from the hook thread
 static volatile LPARAM g_mmLp;
 static volatile WPARAM g_mmWp;
-static double g_seekTarget;
 static char g_osdBuf[96];
-static DWORD g_lastView, g_lastLoad;
+static DWORD g_lastLoad;
 static int g_pending = -1, g_mode = -1;     // g_mode: 0 photo, 1 video
+static bool g_timerOn;
 
 // ======================= helpers =======================
 static std::string U8(const std::wstring& w) {
@@ -111,7 +109,7 @@ static void cmd(const char* a, const char* b = 0, const char* c = 0, const char*
 }
 static void setp(const char* n, const char* v) { const char* s = v; p_mpv_set_property_async(h, 0, n, MPV_FORMAT_STRING, &s); }
 static void setd(const char* n, double v) { p_mpv_set_property_async(h, 0, n, MPV_FORMAT_DOUBLE, &v); }
-// blocking read: ONLY for user-initiated rare things (menus, info)
+// blocking read: ONLY for user-initiated rare things (menus, info, track names)
 static std::string mgets(const char* n) {
     char* s = p_mpv_get_property_string(h, n);
     std::string r = s ? s : "";
@@ -128,7 +126,6 @@ static void osdLater(const char* fmt, ...) {      // coalesced: only the latest 
     va_list ap; va_start(ap, fmt); vsnprintf(g_osdBuf, sizeof g_osdBuf, fmt, ap); va_end(ap);
     g_osdDirty = true;
 }
-static bool g_timerOn;
 static void kick() { if (!g_timerOn) { SetTimer(g_mw, 2, 16, 0); g_timerOn = true; } }   // fallback flush timer
 static double nowms() {
     static LARGE_INTEGER f;
@@ -137,10 +134,15 @@ static double nowms() {
     QueryPerformanceCounter(&c);
     return c.QuadPart * 1000.0 / f.QuadPart;
 }
-static void pump();
 static void showUI() { g_ui = GetTickCount() + std::max(1, o_uisec) * 1000; }
+static void pump();
+static void openSettings();
+static void menuCmd(int id);
+static void act(const std::string& a);
+static void openPanel(int p, int anchor);
+static void closePanel();
 
-// ======================= file list =======================
+// ======================= file types =======================
 static bool extIn(std::wstring e, const wchar_t* const* L_, int n) {
     for (auto& c : e) c = towlower(c);
     for (int i = 0; i < n; i++) if (e == L_[i]) return true;
@@ -177,6 +179,8 @@ static const std::wstring& mediaFilter() {            // file-open dialog filter
     }
     return f;
 }
+
+// ======================= folder scan (off the main thread) =======================
 static void scanInto(const std::wstring& file, std::vector<std::wstring>& v, int& ix) {
     wchar_t dir[MAX_PATH * 2];
     wcsncpy(dir, file.c_str(), MAX_PATH * 2 - 1);
@@ -198,8 +202,6 @@ static void scanInto(const std::wstring& file, std::vector<std::wstring>& v, int
     if (ix < 0) { v.push_back(file); ix = (int)v.size() - 1; }
 }
 static void scan(const std::wstring& file) { scanInto(file, files, idx); }
-
-// At start-up only the opened file is known; the folder is scanned on a worker thread AFTER the first frame is shown.
 static std::wstring g_full;
 static bool g_scanPending;
 static volatile LONG g_scanTok;
@@ -242,19 +244,24 @@ static void applyRuntime() {
     g_mode = -1; applyMode(g_isVid); g_mode = g_isVid ? 1 : 0;
     setp("hwdec", o_hwdec ? "auto-safe" : "no");
     setp("icc-profile-auto", o_icc ? "yes" : "no");
+    setp("audio-channels", o_stereo ? "stereo" : "auto-safe");
     setp("ontop", o_ontop ? "yes" : "no");
-    char b[16]; snprintf(b, 16, "%d", std::max(10, o_subsize)); setp("sub-font-size", b);
 }
 
-// ======================= view state (zoom / pan / volume ...) =======================
+// ======================= view / audio state =======================
 static void sendView() { setd("video-zoom", s_zoom); setd("video-pan-x", s_px); setd("video-pan-y", s_py); }
 static void viewChanged() { g_viewDirty = true; kick(); }
 static void setVol(double v) { s_vol = std::clamp(v, 0.0, 130.0); setd("volume", s_vol); }
-static void setBright(double v) { s_bright = std::clamp(v, -100.0, 100.0); setd("brightness", s_bright); }
-static void setSpeed(double v) { s_speed = std::clamp(floor(v * 100 + 0.5) / 100, 0.1, 8.0); setd("speed", s_speed); }
+static void setBright(double v) { s_bright = std::clamp(floor(v + 0.5), -100.0, 100.0); setd("brightness", s_bright); }
+static void setContrast(double v) { s_contrast = std::clamp(floor(v + 0.5), -100.0, 100.0); setd("contrast", s_contrast); }
+static void setSat(double v) { s_sat = std::clamp(floor(v + 0.5), -100.0, 100.0); setd("saturation", s_sat); }
+static void setSpeed(double v) { s_speed = std::clamp(floor(v * 20 + 0.5) / 20, 0.1, 8.0); setd("speed", s_speed); }
+static void setSubScale(double v) { s_subscale = std::clamp(floor(v * 20 + 0.5) / 20, 0.3, 3.0); setd("sub-scale", s_subscale); }
+static void setSubDelay(double v) { s_subdelay = floor(v * 10 + 0.5) / 10; setd("sub-delay", s_subdelay); }
+static void setAudDelay(double v) { s_audiodelay = floor(v * 10 + 0.5) / 10; setd("audio-delay", s_audiodelay); }
 
 // ======================= Windows codec route (HEIC, RAW, JPEG XR, fallback) =======================
-// Decoded on a worker thread to a 24-bit BMP held in memory, then served to mpv via a custom "lvmem://" stream.
+// Decoded on a low-priority worker thread to a 24-bit BMP held in memory, then served to mpv via a custom "lvmem://" stream.
 struct Blob { std::vector<unsigned char> d; };
 static CRITICAL_SECTION g_bl;
 static std::vector<std::pair<int, std::shared_ptr<Blob>>> g_blobList;
@@ -337,6 +344,7 @@ static volatile LONG g_wicToken;
 static int g_wicTried = -1;
 static DWORD WINAPI wicThread(LPVOID p) {
     WicJob* j = (WicJob*)p;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // keep the window responsive while decoding
     CoInitializeEx(0, COINIT_MULTITHREADED);
     std::shared_ptr<Blob> b = wicDecode(j->path);
     CoUninitialize();
@@ -355,12 +363,49 @@ static void showCantOpen() {
     cmd("show-text", "Can't open this file (missing codec?)\nHEIC / RAW: install the free HEIF, HEVC and RAW image extensions from the Microsoft Store", "6000");
 }
 
+// ======================= resume position (per video) =======================
+static wchar_t g_resIni[MAX_PATH];
+static std::wstring g_curVid;                   // video currently loaded (for saving its position)
+static DWORD g_toastUntil;                      // "Resumed at ..." popup
+static double g_toastPos;
+static std::wstring resKey(const std::wstring& p) {
+    std::wstring l = p;
+    for (auto& c : l) c = towlower(c);
+    unsigned long long hh = 1469598103934665603ULL;
+    for (wchar_t c : l) { hh ^= (unsigned long long)c; hh *= 1099511628211ULL; }
+    wchar_t b[40];
+    _snwprintf(b, 40, L"%08x%08x", (unsigned)(hh >> 32), (unsigned)(hh & 0xffffffffu));
+    return b;
+}
+static bool resGet(const std::wstring& p, double& pos, double& dur) {
+    wchar_t v[64];
+    GetPrivateProfileStringW(L"r", resKey(p).c_str(), L"", v, 64, g_resIni);
+    if (!v[0]) return false;
+    wchar_t* e = 0;
+    pos = wcstod(v, &e);
+    if (!e || *e != L',') return false;
+    dur = wcstod(e + 1, 0);
+    return true;
+}
+static void saveResume() {
+    if (!o_resume || g_curVid.empty() || c_dur < 20) return;
+    std::wstring k = resKey(g_curVid);
+    if (c_pos > c_dur - 8) { WritePrivateProfileStringW(L"r", k.c_str(), 0, g_resIni); return; }    // finished: forget it
+    if (c_pos < 8) return;
+    wchar_t v[64];
+    _snwprintf(v, 64, L"%.1f,%.1f", c_pos, c_dur);
+    WritePrivateProfileStringW(L"r", k.c_str(), v, g_resIni);
+}
+
 // ======================= loading =======================
 static void doLoad() {
     int i = g_pending; g_pending = -1;
     if (i < 0 || i >= (int)files.size()) return;
     g_lastLoad = GetTickCount();
     InterlockedIncrement(&g_wicToken);              // drop any decode still running for a previous file
+    saveResume();                                    // remember where the previous video stopped
+    g_curVid.clear(); c_pos = 0; c_dur = 0; g_toastUntil = 0;
+    closePanel();
     std::wstring p = files[i];
     std::wstring e = PathFindExtensionW(p.c_str());
     for (auto& c : e) c = towlower(c);
@@ -373,7 +418,18 @@ static void doLoad() {
     if (lp != s_loop) { s_loop = lp; setp("loop-file", lp ? "inf" : "no"); }
     if (isWicPrimary(e)) { startWic(i, false); return; }   // HEIC / RAW / JXR: decode with Windows codecs (old picture stays until ready)
     std::string u = U8(p);
-    cmd("loadfile", u.c_str(), "replace");
+    char st[48] = "";
+    double rp = 0, rd = 0;
+    if (vid) {
+        g_curVid = p;
+        if (o_resume && resGet(p, rp, rd) && rp >= 8 && rp < rd - 8) {   // continue where it stopped; a popup lets you start over
+            snprintf(st, sizeof st, "start=%.2f", rp);
+            g_toastUntil = GetTickCount() + 7000;
+            g_toastPos = rp;
+        }
+    }
+    if (st[0]) cmd("loadfile", u.c_str(), "replace", "-1", st);
+    else cmd("loadfile", u.c_str(), "replace");
     setp("pause", "no");
 }
 static void openIdx(int i) {
@@ -450,18 +506,22 @@ static DWORD WINAPI preloadThread(LPVOID) {
     return 0;
 }
 
-// ======================= settings storage =======================
-struct Act { const char* id; const wchar_t* label; };
+// ======================= settings storage (separate shortcuts for photo and video) =======================
+struct Act { const char* id; const wchar_t* label; int mask; };      // mask: 1 photo, 2 video
 static const Act ACTS[] = {
-    {"close", L"Close viewer"}, {"next", L"Next file"}, {"prev", L"Previous file"}, {"first", L"First file"}, {"last", L"Last file"},
-    {"pause", L"Play / pause"}, {"volup", L"Volume up"}, {"voldown", L"Volume down"}, {"mute", L"Mute"}, {"fullscreen", L"Fullscreen"},
-    {"seekfwd", L"Seek forward 5 s"}, {"seekback", L"Seek back 5 s"}, {"framenext", L"Next frame"}, {"frameback", L"Previous frame"},
-    {"zoomin", L"Zoom in"}, {"zoomout", L"Zoom out"}, {"zoomreset", L"Reset zoom"}, {"rotate", L"Rotate"},
-    {"brightup", L"Brightness up"}, {"brightdown", L"Brightness down"}, {"speedup", L"Speed up"}, {"speeddown", L"Speed down"},
-    {"speedreset", L"Reset speed"}, {"subcycle", L"Next subtitle track"}, {"audiocycle", L"Next audio track"},
-    {"subdelayminus", L"Subtitle delay -0.1 s"}, {"subdelayplus", L"Subtitle delay +0.1 s"}, {"loop", L"Loop video"},
-    {"screenshot", L"Screenshot"}, {"info", L"File info"}, {"delete", L"Delete file (Recycle Bin)"},
-    {"quality", L"Toggle high quality / fast mode"}, {"menu", L"Context menu"}, {"settings", L"Settings"}};
+    {"close", L"Close viewer", 3}, {"next", L"Next file", 3}, {"prev", L"Previous file", 3}, {"first", L"First file", 3},
+    {"last", L"Last file", 3}, {"fullscreen", L"Fullscreen", 3}, {"info", L"File info", 3}, {"delete", L"Delete file (Recycle Bin)", 3},
+    {"settings", L"Settings", 3}, {"menu", L"Context menu", 3}, {"brightup", L"Brightness up", 3}, {"brightdown", L"Brightness down", 3},
+    {"rotate", L"Rotate", 3}, {"zoomin", L"Zoom in", 3}, {"zoomout", L"Zoom out", 3}, {"zoomreset", L"Reset zoom", 3},
+    {"quality", L"Cycle quality (Fast / High / Ultra)", 1},
+    {"pause", L"Play / pause", 2}, {"volup", L"Volume up", 2}, {"voldown", L"Volume down", 2}, {"mute", L"Mute", 2},
+    {"seekfwd", L"Seek forward 5 s", 2}, {"seekback", L"Seek back 5 s", 2}, {"seekfwd10", L"Seek forward 10 s", 2},
+    {"seekback10", L"Seek back 10 s", 2}, {"framenext", L"Next frame", 2}, {"frameback", L"Previous frame", 2},
+    {"speedup", L"Speed up", 2}, {"speeddown", L"Speed down", 2}, {"speedreset", L"Reset speed", 2},
+    {"subcycle", L"Next subtitle track", 2}, {"audiocycle", L"Next audio track", 2},
+    {"subdelayminus", L"Subtitle delay -0.1 s", 2}, {"subdelayplus", L"Subtitle delay +0.1 s", 2},
+    {"audiodelayminus", L"Audio delay -0.1 s", 2}, {"audiodelayplus", L"Audio delay +0.1 s", 2},
+    {"loop", L"Loop video", 2}, {"screenshot", L"Screenshot", 2}};
 static const int NACT = sizeof(ACTS) / sizeof(*ACTS);
 
 struct KeyName { const wchar_t* n; int v; };
@@ -489,33 +549,34 @@ static std::wstring nameOf(int vk) {
 }
 
 struct DefKey { const wchar_t* k; const char* a; };
-static const DefKey DEFK[] = {
+static const DefKey DEFK_P[] = {                       // photo viewer
     {L"Esc", "close"}, {L"Right", "next"}, {L"Left", "prev"}, {L"PgDn", "next"}, {L"PgUp", "prev"}, {L"Home", "first"}, {L"End", "last"},
-    {L"Space", "pause"}, {L"K", "pause"}, {L"Up", "volup"}, {L"Down", "voldown"}, {L"M", "mute"}, {L"F", "fullscreen"},
-    {L"Enter", "fullscreen"}, {L"J", "seekback"}, {L"L", "seekfwd"}, {L"Period", "framenext"}, {L"Comma", "frameback"},
-    {L"R", "rotate"}, {L"Plus", "zoomin"}, {L"Minus", "zoomout"}, {L"0", "zoomreset"}, {L"B", "brightup"}, {L"V", "brightdown"},
+    {L"F", "fullscreen"}, {L"Enter", "fullscreen"}, {L"Plus", "zoomin"}, {L"Minus", "zoomout"}, {L"0", "zoomreset"}, {L"R", "rotate"},
+    {L"B", "brightup"}, {L"V", "brightdown"}, {L"I", "info"}, {L"Delete", "delete"}, {L"Q", "quality"}, {L"S", "settings"},
+    {L"F1", "settings"}, {L"Tab", "menu"}};
+static const DefKey DEFK_V[] = {                       // video player: arrows seek / change volume
+    {L"Esc", "close"}, {L"Right", "seekfwd"}, {L"Left", "seekback"}, {L"Up", "volup"}, {L"Down", "voldown"}, {L"PgDn", "next"},
+    {L"PgUp", "prev"}, {L"Home", "first"}, {L"End", "last"}, {L"Space", "pause"}, {L"K", "pause"}, {L"M", "mute"}, {L"F", "fullscreen"},
+    {L"Enter", "fullscreen"}, {L"J", "seekback10"}, {L"L", "seekfwd10"}, {L"Period", "framenext"}, {L"Comma", "frameback"},
     {L"RBracket", "speedup"}, {L"LBracket", "speeddown"}, {L"Backspace", "speedreset"}, {L"C", "subcycle"}, {L"A", "audiocycle"},
-    {L"Z", "subdelayminus"}, {L"X", "subdelayplus"}, {L"O", "loop"}, {L"P", "screenshot"}, {L"I", "info"}, {L"Delete", "delete"},
-    {L"Q", "quality"}, {L"S", "settings"}, {L"F1", "settings"}, {L"Tab", "menu"}};
+    {L"Z", "subdelayminus"}, {L"X", "subdelayplus"}, {L"O", "loop"}, {L"P", "screenshot"}, {L"R", "rotate"}, {L"B", "brightup"},
+    {L"V", "brightdown"}, {L"Plus", "zoomin"}, {L"Minus", "zoomout"}, {L"0", "zoomreset"}, {L"I", "info"}, {L"Delete", "delete"},
+    {L"S", "settings"}, {L"F1", "settings"}, {L"Tab", "menu"}};
 
 static wchar_t g_ini[MAX_PATH];
 static void cfgPath() {
     SHGetFolderPathW(0, CSIDL_APPDATA, 0, 0, g_ini);
     PathAppendW(g_ini, L"LiteView");
     CreateDirectoryW(g_ini, 0);
+    wcscpy(g_resIni, g_ini);
+    PathAppendW(g_resIni, L"resume.ini");
     PathAppendW(g_ini, L"keys.ini");
 }
-static void applyDefaultKeys(bool onlyMissing) {
-    for (auto& d : DEFK) {
-        int vk = vkOf(d.k);
-        if (!vk) continue;
-        if (onlyMissing) {
-            bool has = false;
-            for (int i = 1; i < 256; i++) if (KM[i] == d.a) { has = true; break; }
-            if (has || !KM[vk].empty()) continue;
-        }
-        KM[vk] = d.a;
-    }
+static void applyDefaultKeys(int m) {
+    for (auto& s : KMS[m]) s.clear();
+    const DefKey* t = m ? DEFK_V : DEFK_P;
+    int n = m ? CNT(DEFK_V) : CNT(DEFK_P);
+    for (int i = 0; i < n; i++) { int vk = vkOf(t[i].k); if (vk) KMS[m][vk] = t[i].a; }
 }
 static int gi(const wchar_t* k, int d) { return GetPrivateProfileIntW(L"options", k, d, g_ini); }
 static void gs(const wchar_t* k, wchar_t* out) { GetPrivateProfileStringW(L"options", k, L"", out, 16, g_ini); }
@@ -525,18 +586,18 @@ static void loadSettings() {
     cfgPath();
     o_autonext = gi(L"autonext", 1); o_remvol = gi(L"remember_volume", 1); o_vol = gi(L"volume", 100);
     o_startfs = gi(L"start_fullscreen", 0); o_ontop = gi(L"always_on_top", 0); o_uisec = gi(L"controls_hide_seconds", 2);
-    o_preload = gi(L"preload", 1); o_inv = gi(L"invert_swipe", 0); o_swipe = gi(L"swipe_distance", 300);
+    o_preload = gi(L"preload", 1); o_inv = gi(L"invert_swipe", 0); o_invv = gi(L"reverse_scroll", 0); o_swipe = gi(L"swipe_distance", 300);
     o_hq = gi(L"high_quality", 1); o_smooth = gi(L"smooth_motion", 0); o_deband = gi(L"deband_video", 0);
     o_ultra = gi(L"ultra_quality", 0); o_icc = gi(L"icc_profile", 0); o_next = gi(L"gpu_next", 0);
-    o_hwdec = gi(L"hardware_decoding", 1); o_subsize = gi(L"subtitle_size", 40);
+    o_hwdec = gi(L"hardware_decoding", 1); o_stereo = gi(L"stereo_downmix", 1); o_resume = gi(L"remember_position", 1);
+    o_subpct = std::clamp(gi(L"subtitle_size_percent", 100), 30, 300);
     gs(L"subtitle_language", o_slang); gs(L"audio_language", o_alang);
-    int ver = gi(L"version", 0);
-    if (ver < 3) o_smooth = 0;                      // lighter default for older PCs
+    static const wchar_t* sec[2] = {L"keys_photo", L"keys_video"};
     static wchar_t buf[8192];
-    DWORD n = GetPrivateProfileSectionW(L"keys", buf, 8192, g_ini);
-    for (auto& s : KM) s.clear();
-    if (n == 0) applyDefaultKeys(false);
-    else {
+    for (int m = 0; m < 2; m++) {
+        for (auto& s : KMS[m]) s.clear();
+        DWORD n = GetPrivateProfileSectionW(sec[m], buf, 8192, g_ini);
+        if (n == 0) { applyDefaultKeys(m); continue; }
         for (wchar_t* s = buf; *s; s += wcslen(s) + 1) {
             wchar_t* eq = wcschr(s, L'=');
             if (!eq) continue;
@@ -544,36 +605,141 @@ static void loadSettings() {
             wchar_t* k = s; wchar_t* v = eq + 1;
             StrTrimW(k, L" \t"); StrTrimW(v, L" \t");
             int vk = vkOf(k);
-            if (vk > 0 && vk < 256) KM[vk] = U8(v);
+            if (vk > 0 && vk < 256) KMS[m][vk] = U8(v);
         }
-        if (ver < 2) applyDefaultKeys(true);          // pick up new default shortcuts once
     }
 }
 static void saveSettings() {
-    wi(L"version", 3); wi(L"ultra_quality", o_ultra); wi(L"icc_profile", o_icc); wi(L"gpu_next", o_next);
+    wi(L"version", 4);
     wi(L"autonext", o_autonext); wi(L"remember_volume", o_remvol); wi(L"volume", o_vol); wi(L"start_fullscreen", o_startfs);
     wi(L"always_on_top", o_ontop); wi(L"controls_hide_seconds", o_uisec); wi(L"preload", o_preload); wi(L"invert_swipe", o_inv);
-    wi(L"swipe_distance", o_swipe); wi(L"high_quality", o_hq); wi(L"smooth_motion", o_smooth); wi(L"deband_video", o_deband);
-    wi(L"hardware_decoding", o_hwdec); wi(L"subtitle_size", o_subsize);
+    wi(L"reverse_scroll", o_invv); wi(L"swipe_distance", o_swipe); wi(L"high_quality", o_hq); wi(L"smooth_motion", o_smooth);
+    wi(L"deband_video", o_deband); wi(L"ultra_quality", o_ultra); wi(L"icc_profile", o_icc); wi(L"gpu_next", o_next);
+    wi(L"hardware_decoding", o_hwdec); wi(L"stereo_downmix", o_stereo); wi(L"remember_position", o_resume);
+    wi(L"subtitle_size_percent", o_subpct);
     WritePrivateProfileStringW(L"options", L"subtitle_language", o_slang, g_ini);
     WritePrivateProfileStringW(L"options", L"audio_language", o_alang, g_ini);
-    WritePrivateProfileStringW(L"keys", 0, 0, g_ini);
-    for (int vk = 1; vk < 256; vk++) {
-        if (KM[vk].empty()) continue;
-        std::wstring nm = nameOf(vk);
-        if (!nm.empty()) WritePrivateProfileStringW(L"keys", nm.c_str(), Wd(KM[vk]).c_str(), g_ini);
+    static const wchar_t* sec[2] = {L"keys_photo", L"keys_video"};
+    for (int m = 0; m < 2; m++) {
+        WritePrivateProfileStringW(sec[m], 0, 0, g_ini);
+        for (int vk = 1; vk < 256; vk++) {
+            if (KMS[m][vk].empty()) continue;
+            std::wstring nm = nameOf(vk);
+            if (!nm.empty()) WritePrivateProfileStringW(sec[m], nm.c_str(), Wd(KMS[m][vk]).c_str(), g_ini);
+        }
     }
 }
 
-// ======================= menus =======================
+// ======================= UI state (panels, drag, hit regions) =======================
+enum { B_PREV = 1, B_BACK, B_PLAY, B_FWD, B_NEXT, B_VOL, B_BRI, B_SPEED, B_SUB, B_AUD, B_MORE, B_ZOUT, B_ZIN, B_ZPILL, B_ROT, B_TSTART, B_TOK };
+enum { P_NONE = 0, P_VOL, P_BRI, P_SPEED, P_SUB, P_AUD };
+enum { H_BTN = 1, H_SEEK, H_SLIDER, H_ROW, H_PANEL, H_RESET };
+enum { S_VOL = 1, S_BRI, S_CON, S_SAT, S_SPEED, S_SUBSIZE, S_SUBDELAY, S_AUDDELAY };
+enum { A_MUTE = 1, A_RESETCOL, A_RESETSPEED, A_SUBCYCLE, A_SUBLOAD, A_SUBOFF, A_AUDCYCLE, A_STEREO };
+struct Hit { int kind, id, x, y, w, h, tx, tw; };
+static Hit g_hits[96];
+static int g_nh;
+static int g_panel, g_panelAnchor;
+static int g_dragKind, g_dragId, g_dragX0, g_dragW;       // 1 = seek bar, 2 = slider
+static double g_scrub;
+static int g_downKind, g_downId;
+static std::string g_subTxt = "Off", g_audTxt = "-";
+struct Row { int type, id; char label[56]; double mn, mx, v, def; int fmt; };   // type 0 slider, 1 action
+
+static bool toastActive() { return g_toastUntil && GetTickCount() < g_toastUntil; }
+static bool controlsVisible() { return GetTickCount() < g_ui || g_panel || g_dragKind || (g_isVid && c_pause); }
+
+static std::string trackTxt(const char* prop) {
+    std::string s = mgets(prop);
+    if (s.empty() || s == "no") return "Off";
+    return "track " + s;
+}
+static int panelRows(int p, Row* r) {
+    int n = 0;
+    auto sl = [&](int id, const char* l, double mn, double mx, double v, double def, int fmt) {
+        Row& x = r[n++]; x.type = 0; x.id = id; snprintf(x.label, sizeof x.label, "%s", l); x.mn = mn; x.mx = mx; x.v = v; x.def = def; x.fmt = fmt; };
+    auto ac = [&](int id, const char* l) {
+        Row& x = r[n++]; x.type = 1; x.id = id; snprintf(x.label, sizeof x.label, "%s", l); x.mn = x.mx = x.v = x.def = 0; x.fmt = 0; };
+    char b[80];
+    switch (p) {
+    case P_VOL: sl(S_VOL, "Volume", 0, 130, s_vol, 100, 0); ac(A_MUTE, s_mute ? "Unmute" : "Mute"); break;
+    case P_BRI: sl(S_BRI, "Brightness", -100, 100, s_bright, 0, 0); sl(S_CON, "Contrast", -100, 100, s_contrast, 0, 0);
+                sl(S_SAT, "Saturation", -100, 100, s_sat, 0, 0); ac(A_RESETCOL, "Reset colours"); break;
+    case P_SPEED: sl(S_SPEED, "Speed", 0.25, 4, s_speed, 1, 1); ac(A_RESETSPEED, "Reset to 1x"); break;
+    case P_SUB: snprintf(b, sizeof b, "Subtitles: %s   (tap to switch)", g_subTxt.c_str()); ac(A_SUBCYCLE, b);
+                sl(S_SUBSIZE, "Size", 30, 300, s_subscale * 100, 100, 3); sl(S_SUBDELAY, "Delay", -10, 10, s_subdelay, 0, 2);
+                ac(A_SUBLOAD, "Load subtitle file..."); ac(A_SUBOFF, "Turn subtitles off"); break;
+    case P_AUD: snprintf(b, sizeof b, "Audio: %s   (tap to switch)", g_audTxt.c_str()); ac(A_AUDCYCLE, b);
+                sl(S_AUDDELAY, "Audio delay", -5, 5, s_audiodelay, 0, 2);
+                ac(A_STEREO, o_stereo ? "Stereo downmix: on" : "Stereo downmix: off"); break;
+    }
+    return n;
+}
+static void fmtVal(int f, double v, char* o) {
+    switch (f) {
+    case 1: sprintf(o, "%.2fx", v); break;
+    case 2: sprintf(o, "%+.1f s", v); break;
+    case 3: sprintf(o, "%d%%", (int)floor(v + 0.5)); break;
+    default: sprintf(o, "%d", (int)floor(v + 0.5));
+    }
+}
+static void setSliderId(int id, double v) {
+    switch (id) {
+    case S_VOL: setVol(v); break;
+    case S_BRI: setBright(v); break;
+    case S_CON: setContrast(v); break;
+    case S_SAT: setSat(v); break;
+    case S_SPEED: setSpeed(v); break;
+    case S_SUBSIZE: setSubScale(v / 100.0); o_subpct = (int)floor(s_subscale * 100 + 0.5); break;
+    case S_SUBDELAY: setSubDelay(v); break;
+    case S_AUDDELAY: setAudDelay(v); break;
+    }
+}
+static void openPanel(int p, int anchor) {
+    if (p == P_SUB) g_subTxt = trackTxt("sid");
+    if (p == P_AUD) g_audTxt = trackTxt("aid");
+    g_panel = p; g_panelAnchor = anchor;
+    showUI();
+}
+static void closePanel() { g_panel = P_NONE; g_dragKind = 0; }
+
+static bool pickFile(wchar_t* out, const wchar_t* filter) {
+    OPENFILENAMEW o = {};
+    out[0] = 0;
+    o.lStructSize = sizeof o; o.hwndOwner = g_mw; o.lpstrFile = out; o.nMaxFile = MAX_PATH * 2;
+    o.lpstrFilter = filter; o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameW(&o) != 0;
+}
+static void rowAction(int id) {
+    switch (id) {
+    case A_MUTE: act("mute"); break;
+    case A_RESETCOL: setBright(0); setContrast(0); setSat(0); break;
+    case A_RESETSPEED: setSpeed(1); break;
+    case A_SUBCYCLE: cmd("cycle", "sub"); g_subTxt = trackTxt("sid"); break;
+    case A_SUBLOAD: {
+        wchar_t f[MAX_PATH * 2];
+        if (pickFile(f, L"Subtitles\0*.srt;*.ass;*.ssa;*.vtt;*.sub\0All files\0*.*\0")) { std::string u = U8(f); cmd("sub-add", u.c_str(), "select"); }
+        break;
+    }
+    case A_SUBOFF: setp("sid", "no"); g_subTxt = "Off"; break;
+    case A_AUDCYCLE: cmd("cycle", "audio"); g_audTxt = trackTxt("aid"); break;
+    case A_STEREO: o_stereo = !o_stereo; setp("audio-channels", o_stereo ? "stereo" : "auto-safe"); saveSettings(); break;
+    }
+}
+
+// ======================= menus (compact, categorised) =======================
 enum { M_OPEN = 1, M_EXPLORER, M_DELETE, M_PREV, M_NEXT, M_PLAY, M_BACK, M_FWD, M_LOOP, M_ZRESET, M_ROTATE, M_FULL, M_TOP, M_SHOT,
-       M_INFO, M_QUALITY, M_SETTINGS, M_EXIT, M_SUBOFF, M_SUBLOAD, M_SUBDM, M_SUBDP, M_SUBSM, M_SUBBG, M_AUDDM, M_AUDDP, M_MUTE };
-static const double SPEEDS[] = {0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4};
+       M_INFO, M_QUALITY, M_SETTINGS, M_EXIT, M_SUBOFF, M_SUBLOAD, M_MUTE, M_P_VOL, M_P_BRI, M_P_SPEED, M_P_SUB, M_P_AUD };
 static const char* const ASPECTS[] = {"-1", "16:9", "4:3", "21:9", "1:1"};
 static const wchar_t* const ASPECT_L[] = {L"Auto", L"16:9", L"4:3", L"21:9", L"1:1"};
 
-static void addStr(HMENU m, UINT id, const wchar_t* t, bool chk = false, bool dis = false) {
-    AppendMenuW(m, MF_STRING | (chk ? MF_CHECKED : 0) | (dis ? MF_GRAYED : 0), id, t);
+static void addStr(HMENU m, UINT id, const wchar_t* t, bool chk = false) {
+    AppendMenuW(m, MF_STRING | (chk ? MF_CHECKED : 0), id, t);
+}
+static HMENU subMenu(HMENU parent, const wchar_t* title) {
+    HMENU s = CreatePopupMenu();
+    AppendMenuW(parent, MF_POPUP, (UINT_PTR)s, title);
+    return s;
 }
 static void addTracks(HMENU m, const char* type, int base) {
     int n = atoi(mgets("track-list/count").c_str()), added = 0;
@@ -591,61 +757,48 @@ static void addTracks(HMENU m, const char* type, int base) {
     }
     if (!added) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"(none)");
 }
-static HMENU menuSubs() {
-    HMENU m = CreatePopupMenu();
-    addStr(m, M_SUBOFF, L"Off", mgets("sid") == "no");
-    addTracks(m, "sub", 2000);
-    AppendMenuW(m, MF_SEPARATOR, 0, 0);
-    addStr(m, M_SUBLOAD, L"Load subtitle file...");
-    addStr(m, M_SUBDM, L"Delay -0.1 s"); addStr(m, M_SUBDP, L"Delay +0.1 s");
-    addStr(m, M_SUBSM, L"Smaller"); addStr(m, M_SUBBG, L"Bigger");
-    return m;
-}
-static HMENU menuAudio() {
-    HMENU m = CreatePopupMenu();
-    addTracks(m, "audio", 1000);
-    AppendMenuW(m, MF_SEPARATOR, 0, 0);
-    addStr(m, M_MUTE, L"Mute", s_mute);
-    addStr(m, M_AUDDM, L"Audio delay -0.1 s"); addStr(m, M_AUDDP, L"Audio delay +0.1 s");
-    return m;
-}
-static HMENU menuSpeed() {
-    HMENU m = CreatePopupMenu();
-    for (int i = 0; i < 9; i++) {
-        wchar_t b[24]; _snwprintf(b, 24, L"%gx", SPEEDS[i]);
-        addStr(m, 200 + i, b, fabs(s_speed - SPEEDS[i]) < 0.01);
-    }
-    return m;
-}
-static HMENU menuAspect() {
-    HMENU m = CreatePopupMenu();
-    for (int i = 0; i < 5; i++) addStr(m, 100 + i, ASPECT_L[i]);
-    return m;
-}
 static HMENU menuContext() {
     HMENU m = CreatePopupMenu();
     addStr(m, M_OPEN, L"Open file...");
-    addStr(m, M_EXPLORER, L"Show in Explorer");
-    addStr(m, M_DELETE, L"Delete (Recycle Bin)\tDel");
+    if (!g_isVid) { addStr(m, M_PREV, L"Previous\tLeft"); addStr(m, M_NEXT, L"Next\tRight"); }
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
-    addStr(m, M_PREV, L"Previous\tLeft"); addStr(m, M_NEXT, L"Next\tRight");
+    HMENU f = subMenu(m, L"File");
+    addStr(f, M_EXPLORER, L"Show in Explorer");
+    addStr(f, M_INFO, L"File info\tI");
+    if (g_isVid) addStr(f, M_SHOT, L"Screenshot\tP");
+    addStr(f, M_DELETE, L"Delete (Recycle Bin)\tDel");
     if (g_isVid) {
-        AppendMenuW(m, MF_SEPARATOR, 0, 0);
-        addStr(m, M_PLAY, c_pause ? L"Play\tSpace" : L"Pause\tSpace");
-        addStr(m, M_BACK, L"Back 10 s"); addStr(m, M_FWD, L"Forward 10 s");
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)menuSpeed(), L"Speed");
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)menuAudio(), L"Audio");
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)menuSubs(), L"Subtitles");
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)menuAspect(), L"Aspect ratio");
-        addStr(m, M_LOOP, L"Loop", s_loop);
+        HMENU p = subMenu(m, L"Playback");
+        addStr(p, M_PLAY, c_pause ? L"Play\tSpace" : L"Pause\tSpace");
+        addStr(p, M_BACK, L"Back 10 s"); addStr(p, M_FWD, L"Forward 10 s");
+        addStr(p, M_PREV, L"Previous video"); addStr(p, M_NEXT, L"Next video");
+        addStr(p, M_LOOP, L"Loop", s_loop);
+        addStr(p, M_P_SPEED, L"Speed...");
+        HMENU a = subMenu(m, L"Audio");
+        addTracks(a, "audio", 1000);
+        AppendMenuW(a, MF_SEPARATOR, 0, 0);
+        addStr(a, M_MUTE, L"Mute", s_mute);
+        addStr(a, M_P_VOL, L"Volume...");
+        addStr(a, M_P_AUD, L"Delay and stereo...");
+        HMENU s = subMenu(m, L"Subtitles");
+        addStr(s, M_SUBOFF, L"Off");
+        addTracks(s, "sub", 2000);
+        AppendMenuW(s, MF_SEPARATOR, 0, 0);
+        addStr(s, M_SUBLOAD, L"Load file...");
+        addStr(s, M_P_SUB, L"Size and delay...");
     }
+    HMENU v = subMenu(m, L"View");
+    addStr(v, M_P_BRI, L"Brightness and colour...");
+    addStr(v, M_ZRESET, L"Reset zoom\t0");
+    addStr(v, M_ROTATE, L"Rotate\tR");
+    if (g_isVid) {
+        HMENU ar = subMenu(v, L"Aspect ratio");
+        for (int i = 0; i < 5; i++) addStr(ar, 100 + i, ASPECT_L[i]);
+    } else addStr(v, M_QUALITY, L"Cycle quality");
+    HMENU w = subMenu(m, L"Window");
+    addStr(w, M_FULL, L"Fullscreen\tF", c_full);
+    addStr(w, M_TOP, L"Always on top", o_ontop != 0);
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
-    addStr(m, M_ZRESET, L"Reset zoom\t0"); addStr(m, M_ROTATE, L"Rotate\tR");
-    addStr(m, M_FULL, L"Fullscreen\tF", isYes("fullscreen"));
-    addStr(m, M_TOP, L"Always on top", o_ontop != 0);
-    addStr(m, M_SHOT, L"Screenshot\tP"); addStr(m, M_INFO, L"File info\tI");
-    AppendMenuW(m, MF_SEPARATOR, 0, 0);
-    addStr(m, M_QUALITY, L"Cycle quality (Fast / High / Ultra)");
     addStr(m, M_SETTINGS, L"Settings...\tS");
     addStr(m, M_EXIT, L"Exit\tEsc");
     return m;
@@ -658,16 +811,7 @@ static int popup(HMENU m, int sx, int sy, UINT extra = 0) {
     if (g_vw) SetForegroundWindow(g_vw);
     return id;
 }
-
-static bool pickFile(wchar_t* out, const wchar_t* filter) {
-    OPENFILENAMEW o = {};
-    out[0] = 0;
-    o.lStructSize = sizeof o; o.hwndOwner = g_mw; o.lpstrFile = out; o.nMaxFile = MAX_PATH * 2;
-    o.lpstrFilter = filter; o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    return GetOpenFileNameW(&o) != 0;
-}
-static void openSettings();
-void menuCmd(int id);
+static int clientW() { RECT r = {}; if (g_vw) GetClientRect(g_vw, &r); return r.right; }
 
 static void doDelete() {
     if (idx < 0 || idx >= (int)files.size()) return;
@@ -688,8 +832,6 @@ static void doDelete() {
     }
     if (empty) cmd("quit"); else osd("Moved to Recycle Bin");
 }
-
-// ======================= actions =======================
 static void showInfo() {
     std::string nm = U8(PathFindFileNameW(files[idx].c_str()));
     std::string w = mgets("video-params/w"), hh = mgets("video-params/h"), fm = mgets("file-format");
@@ -698,6 +840,8 @@ static void showInfo() {
     snprintf(b, sizeof b, "%s\n%sx%s    %.1f MB    %s", nm.c_str(), w.c_str(), hh.c_str(), mb, fm.c_str());
     cmd("show-text", b, "3500");
 }
+
+// ======================= actions =======================
 static void act(const std::string& a) {
     if (a == "close") cmd("quit");
     else if (a == "next") go(1);
@@ -711,21 +855,25 @@ static void act(const std::string& a) {
     else if (a == "fullscreen") cmd("cycle", "fullscreen");
     else if (a == "seekfwd") cmd("seek", "5");
     else if (a == "seekback") cmd("seek", "-5");
+    else if (a == "seekfwd10") cmd("seek", "10");
+    else if (a == "seekback10") cmd("seek", "-10");
     else if (a == "framenext") cmd("frame-step");
     else if (a == "frameback") cmd("frame-back-step");
     else if (a == "zoomin") { s_zoom = std::min(6.0, s_zoom + 0.1); viewChanged(); osdLater("Zoom %d%%", (int)(100 * pow(2.0, s_zoom))); }
     else if (a == "zoomout") { s_zoom = std::max(-1.0, s_zoom - 0.1); if (s_zoom <= 0.001) s_px = s_py = 0; viewChanged(); osdLater("Zoom %d%%", (int)(100 * pow(2.0, s_zoom))); }
     else if (a == "zoomreset") { s_zoom = s_px = s_py = 0; viewChanged(); osdLater("Zoom 100%%"); }
     else if (a == "rotate") { s_rot = (s_rot + 90) % 360; setd("video-rotate", s_rot); }
-    else if (a == "brightup") { setBright(s_bright + 3); osdf("Brightness %d", (int)floor(s_bright + 0.5)); }
-    else if (a == "brightdown") { setBright(s_bright - 3); osdf("Brightness %d", (int)floor(s_bright + 0.5)); }
-    else if (a == "speedup") { setSpeed(s_speed * 1.1); osdf("Speed %gx", s_speed); }
-    else if (a == "speeddown") { setSpeed(s_speed / 1.1); osdf("Speed %gx", s_speed); }
-    else if (a == "speedreset") { setSpeed(1); osd("Speed 1x"); }
-    else if (a == "subcycle") { cmd("cycle", "sub"); std::string s = mgets("sid"); osdf("Subtitles: %s", (s == "no" || s.empty()) ? "Off" : ("track " + s).c_str()); }
-    else if (a == "audiocycle") { cmd("cycle", "audio"); std::string s = mgets("aid"); osdf("Audio: %s", (s == "no" || s.empty()) ? "Off" : ("track " + s).c_str()); }
-    else if (a == "subdelayminus") { s_subdelay -= 0.1; setd("sub-delay", s_subdelay); osdf("Subtitle delay %+.1f s", s_subdelay); }
-    else if (a == "subdelayplus") { s_subdelay += 0.1; setd("sub-delay", s_subdelay); osdf("Subtitle delay %+.1f s", s_subdelay); }
+    else if (a == "brightup") { setBright(s_bright + 3); osdf("Brightness %d", (int)s_bright); }
+    else if (a == "brightdown") { setBright(s_bright - 3); osdf("Brightness %d", (int)s_bright); }
+    else if (a == "speedup") { setSpeed(s_speed * 1.1); osdf("Speed %.2fx", s_speed); }
+    else if (a == "speeddown") { setSpeed(s_speed / 1.1); osdf("Speed %.2fx", s_speed); }
+    else if (a == "speedreset") { setSpeed(1); osd("Speed 1.00x"); }
+    else if (a == "subcycle") { cmd("cycle", "sub"); osdf("Subtitles: %s", trackTxt("sid").c_str()); }
+    else if (a == "audiocycle") { cmd("cycle", "audio"); osdf("Audio: %s", trackTxt("aid").c_str()); }
+    else if (a == "subdelayminus") { setSubDelay(s_subdelay - 0.1); osdf("Subtitle delay %+.1f s", s_subdelay); }
+    else if (a == "subdelayplus") { setSubDelay(s_subdelay + 0.1); osdf("Subtitle delay %+.1f s", s_subdelay); }
+    else if (a == "audiodelayminus") { setAudDelay(s_audiodelay - 0.1); osdf("Audio delay %+.1f s", s_audiodelay); }
+    else if (a == "audiodelayplus") { setAudDelay(s_audiodelay + 0.1); osdf("Audio delay %+.1f s", s_audiodelay); }
     else if (a == "loop") { s_loop = !s_loop; setp("loop-file", s_loop ? "inf" : "no"); osd(s_loop ? "Loop: on" : "Loop: off"); }
     else if (a == "info") showInfo();
     else if (a == "screenshot") {
@@ -739,7 +887,7 @@ static void act(const std::string& a) {
     }
     else if (a == "delete") doDelete();
     else if (a == "quality") {
-        int lv = (o_ultra ? 2 : (o_hq ? 1 : 0) ) ;
+        int lv = o_ultra ? 2 : (o_hq ? 1 : 0);
         lv = (lv + 1) % 3;
         o_ultra = (lv == 2); o_hq = (lv >= 1);
         applyQuality();
@@ -753,11 +901,10 @@ static void act(const std::string& a) {
         if (id) menuCmd(id);
     }
 }
-void menuCmd(int id) {
+static void menuCmd(int id) {
     char b[64];
     if (id >= 2000 && id < 3000) { snprintf(b, 64, "%d", id - 2000); setp("sid", b); return; }
     if (id >= 1000 && id < 2000) { snprintf(b, 64, "%d", id - 1000); setp("aid", b); return; }
-    if (id >= 200 && id < 300) { setSpeed(SPEEDS[id - 200]); osdf("Speed %gx", s_speed); return; }
     if (id >= 100 && id < 200) { setp("video-aspect-override", ASPECTS[id - 100]); return; }
     switch (id) {
     case M_OPEN: {
@@ -787,154 +934,284 @@ void menuCmd(int id) {
     case M_SETTINGS: openSettings(); break;
     case M_EXIT: cmd("quit"); break;
     case M_SUBOFF: setp("sid", "no"); break;
-    case M_SUBLOAD: {
-        wchar_t f[MAX_PATH * 2];
-        if (pickFile(f, L"Subtitles\0*.srt;*.ass;*.ssa;*.vtt;*.sub\0All files\0*.*\0")) { std::string u = U8(f); cmd("sub-add", u.c_str(), "select"); }
-        break;
-    }
-    case M_SUBDM: act("subdelayminus"); break;
-    case M_SUBDP: act("subdelayplus"); break;
-    case M_SUBSM: s_subscale = std::max(0.3, s_subscale - 0.1); setd("sub-scale", s_subscale); osdf("Subtitle size %d%%", (int)floor(s_subscale * 100 + 0.5)); break;
-    case M_SUBBG: s_subscale = std::min(3.0, s_subscale + 0.1); setd("sub-scale", s_subscale); osdf("Subtitle size %d%%", (int)floor(s_subscale * 100 + 0.5)); break;
-    case M_AUDDM: s_audiodelay -= 0.1; setd("audio-delay", s_audiodelay); osdf("Audio delay %+.1f s", s_audiodelay); break;
-    case M_AUDDP: s_audiodelay += 0.1; setd("audio-delay", s_audiodelay); osdf("Audio delay %+.1f s", s_audiodelay); break;
+    case M_SUBLOAD: rowAction(A_SUBLOAD); break;
     case M_MUTE: act("mute"); break;
+    case M_P_VOL: openPanel(P_VOL, clientW() / 2); break;
+    case M_P_BRI: openPanel(P_BRI, clientW() / 2); break;
+    case M_P_SPEED: openPanel(P_SPEED, clientW() / 2); break;
+    case M_P_SUB: openPanel(P_SUB, clientW() / 2); break;
+    case M_P_AUD: openPanel(P_AUD, clientW() / 2); break;
     }
 }
 
-// ======================= on-screen controls (ASS overlay) =======================
-enum { B_PREV = 1, B_BACK, B_PLAY, B_FWD, B_NEXT, B_SUBS, B_AUDIO, B_SPEED, B_MORE };
-struct Btn { int id, x, y, w, h; };
-static Btn g_b[12];
-static int g_nb, g_bx, g_by, g_bw, g_bh, g_rh, g_fs, g_rowY;
-static void addB(int id, int x, int y, int w, int h) { g_b[g_nb++] = {id, x, y, w, h}; }
-static void layout(int W, int H) {
-    g_nb = 0;
-    g_fs = std::max(18, H / 40);
-    int m = W * 4 / 100, mb = std::max(12, H / 40);
-    g_bh = std::max(4, H / 150); g_bx = m; g_bw = W - 2 * m; g_by = H - mb - g_bh;
-    g_rh = std::max(40, H / 16); g_rowY = g_by - g_rh - H / 60;
-    int bw = g_rh * 5 / 4, x0 = W / 2 - bw * 5 / 2;
-    static const int ids[5] = {B_PREV, B_BACK, B_PLAY, B_FWD, B_NEXT};
-    for (int i = 0; i < 5; i++) addB(ids[i], x0 + i * bw, g_rowY, bw, g_rh);
-    static const int tid[4] = {B_MORE, B_SPEED, B_AUDIO, B_SUBS};
-    static const int tl[4] = {3, 5, 5, 9};
-    int xr = W - m;
-    for (int i = 0; i < 4; i++) {
-        int w = (int)(tl[i] * g_fs * 0.62 + g_fs * 1.2);
-        xr -= w;
-        addB(tid[i], xr, g_rowY, w, g_rh);
-        xr -= g_fs / 3;
-    }
+// ======================= modern player UI (vector shapes in an ASS overlay) =======================
+static std::string A, A2, *g_cur = &A;
+static bool g_emit;
+static void ap(const char* f, ...) {
+    if (!g_emit) return;
+    char b[3500];
+    va_list v; va_start(v, f); vsnprintf(b, sizeof b, f, v); va_end(v);
+    *g_cur += b;
 }
-static void fmt(double s, char* o) {
-    int t = (int)s;
+static void shape(int x, int y, const std::string& path, const char* col, const char* al, const char* extra = "") {
+    ap("{\\an7\\pos(%d,%d)\\bord0\\shad0\\blur0.6\\1c&H%s&\\1a&H%s&%s\\p1}%s{\\p0}\n", x, y, col, al, extra, path.c_str());
+}
+static std::string rrPath(int w, int h, int r) {
+    r = std::max(1, std::min(r, std::min(w, h) / 2));
+    double k = 0.5523 * r;
+    char b[640];
+    snprintf(b, sizeof b, "m %d 0 l %d 0 b %.1f 0 %d %.1f %d %d l %d %d b %d %.1f %.1f %d %d %d l %d %d b %.1f %d 0 %.1f 0 %d l 0 %d b 0 %.1f %.1f 0 %d 0",
+             r, w - r, w - r + k, w, r - k, w, r, w, h - r, w, h - r + k, w - r + k, h, w - r, h, r, h, r - k, h, h - r + k, h - r, r, r - k, r - k, r);
+    return b;
+}
+static std::string circlePath(int d) { return rrPath(d, d, d / 2); }
+enum { I_PLAY = 1, I_PAUSE, I_PREV, I_NEXT, I_SPK, I_SUN, I_ROT };
+static std::string iconPath(int k, int s) {
+    char b[700];
+    switch (k) {
+    case I_PLAY: snprintf(b, sizeof b, "m %d 0 l %d %d l %d %d", s * 15 / 100, s, s / 2, s * 15 / 100, s); return b;
+    case I_PAUSE: snprintf(b, sizeof b, "m %d 0 l %d 0 l %d %d l %d %d m %d 0 l %d 0 l %d %d l %d %d",
+                           s * 15 / 100, s * 40 / 100, s * 40 / 100, s, s * 15 / 100, s, s * 60 / 100, s * 85 / 100, s * 85 / 100, s, s * 60 / 100, s); return b;
+    case I_PREV: snprintf(b, sizeof b, "m %d 0 l %d 0 l %d %d l %d %d m %d %d l %d 0 l %d %d",
+                          s * 8 / 100, s * 22 / 100, s * 22 / 100, s, s * 8 / 100, s, s * 32 / 100, s / 2, s, s, s); return b;
+    case I_NEXT: snprintf(b, sizeof b, "m 0 0 l %d %d l 0 %d m %d 0 l %d 0 l %d %d l %d %d",
+                          s * 68 / 100, s / 2, s, s * 78 / 100, s * 92 / 100, s * 92 / 100, s, s * 78 / 100, s); return b;
+    case I_SPK: snprintf(b, sizeof b, "m 0 %d l %d %d l %d %d l %d %d l %d %d l 0 %d m %d %d l %d %d l %d %d l %d %d m %d %d l %d %d l %d %d l %d %d",
+                         s * 36 / 100, s * 22 / 100, s * 36 / 100, s * 50 / 100, s * 10 / 100, s * 50 / 100, s * 90 / 100, s * 22 / 100, s * 64 / 100, s * 64 / 100,
+                         s * 62 / 100, s * 38 / 100, s * 68 / 100, s * 38 / 100, s * 68 / 100, s * 62 / 100, s * 62 / 100, s * 62 / 100,
+                         s * 78 / 100, s * 24 / 100, s * 84 / 100, s * 24 / 100, s * 84 / 100, s * 76 / 100, s * 78 / 100, s * 76 / 100); return b;
+    case I_SUN: {
+        std::string p;
+        for (int i = 0; i < 16; i++) {                                           // disc
+            double a = i * 3.14159265 / 8;
+            snprintf(b, sizeof b, "%s %d %d ", i ? "l" : "m", (int)(s * 0.5 + s * 0.2 * cos(a)), (int)(s * 0.5 + s * 0.2 * sin(a)));
+            p += b;
+        }
+        for (int i = 0; i < 8; i++) {                                            // rays
+            double a = i * 3.14159265 / 4, c = cos(a), sn = sin(a), r1 = s * 0.31, r2 = s * 0.47, hw = s * 0.045;
+            double cx = s * 0.5, cy = s * 0.5;
+            snprintf(b, sizeof b, "m %d %d l %d %d l %d %d l %d %d ",
+                     (int)(cx + c * r1 - sn * hw), (int)(cy + sn * r1 + c * hw), (int)(cx + c * r2 - sn * hw), (int)(cy + sn * r2 + c * hw),
+                     (int)(cx + c * r2 + sn * hw), (int)(cy + sn * r2 - c * hw), (int)(cx + c * r1 + sn * hw), (int)(cy + sn * r1 - c * hw));
+            p += b;
+        }
+        return p;
+    }
+    }
+    return "";
+}
+static int txtw(const std::string& t, int fs) { return (int)(t.size() * fs * 0.56); }
+
+static const char* const ACC = "A6B814";         // accent (BGR)  teal
+static Hit* hitAt(int x, int y) {
+    for (int i = g_nh - 1; i >= 0; i--) {
+        Hit& k = g_hits[i];
+        if (x >= k.x && x < k.x + k.w && y >= k.y && y < k.y + k.h) return &k;
+    }
+    return 0;
+}
+static Hit* findBtn(int id) {
+    for (int i = 0; i < g_nh; i++) if (g_hits[i].kind == H_BTN && g_hits[i].id == id) return &g_hits[i];
+    return 0;
+}
+static void fmtTime(double s, char* o) {
+    int t = s > 0 ? (int)s : 0;
     if (t >= 3600) sprintf(o, "%d:%02d:%02d", t / 3600, t / 60 % 60, t % 60);
     else sprintf(o, "%d:%02d", t / 60, t % 60);
 }
-static bool controlsVisible() { return GetTickCount() < g_ui || (g_isVid && c_pause); }
 
+// Builds hit regions and (if emit) the ASS text for the main overlay (A) and the resume popup (A2).
+static void uiBuild(int W, int H, bool emit) {
+    g_nh = 0; g_emit = emit; A.clear(); A2.clear(); g_cur = &A;
+    const double u = std::clamp(H / 720.0, 0.8, 2.4);
+#define U(v) ((int)((v) * u + 0.5))
+    auto addHit = [&](int kind, int id, int x, int y, int w, int h, int tx = 0, int tw = 0) { if (g_nh < 96) g_hits[g_nh++] = {kind, id, x, y, w, h, tx, tw}; };
+    auto pill = [&](int x, int y, int w, int hh, const char* col, const char* al) { if (g_emit) shape(x, y, rrPath(w, hh, hh / 2), col, al); };
+    auto label = [&](int x, int y, int an, int f, const char* col, const char* t, bool bold) {
+        ap("{\\an%d\\pos(%d,%d)\\fs%d\\b%d\\bord0\\shad0\\1c&H%s&}%s\n", an, x, y, f, bold ? 1 : 0, col, t); };
+    auto icon = [&](int k, int cx, int cy, int s, const char* col, const char* al = "00") { if (g_emit) shape(cx - s / 2, cy - s / 2, iconPath(k, s), col, al); };
+    auto ring = [&](int cx, int cy, int d) { if (g_emit) shape(cx - d / 2, cy - d / 2, circlePath(d), "FFFFFF", "FF", "\\bord2\\3c&HFFFFFF&"); };
+
+    const bool vis = controlsVisible();
+    int barTop = H - U(24);
+    int si = g_shown;
+    if (vis && si >= 0 && si < (int)files.size()) {                      // file name chip (top-left)
+        std::string nm = U8(PathFindFileNameW(files[si].c_str()));
+        for (auto& c : nm) if (c == '{' || c == '}') c = '('; else if (c == '\\') c = '/';
+        if (nm.size() > 56) nm = nm.substr(0, 53) + "...";
+        char cnt[32]; snprintf(cnt, 32, "%d / %d", si + 1, (int)files.size());
+        int f = U(14), w = txtw(nm, f) + txtw(cnt, f) + U(50), hh = U(34), x = U(20), y = U(18);
+        pill(x, y, w, hh, "141414", "40");
+        label(x + U(16), y + hh / 2, 4, f, "FFFFFF", nm.c_str(), false);
+        label(x + w - U(16), y + hh / 2, 6, f, "B8B8B8", cnt, false);
+    }
+    if (vis && g_isVid) {                                                // ---------- video control bar ----------
+        int bw = std::min(W - U(32), U(880)), bh = U(112), bx = (W - bw) / 2, by = H - U(22) - bh;
+        barTop = by;
+        if (g_emit) shape(bx, by, rrPath(bw, bh, U(26)), "141414", "38");
+        addHit(H_PANEL, 0, bx, by, bw, bh);
+        double dur = c_dur, pos = (g_dragKind == 1) ? g_scrub : c_pos;
+        double fr = dur > 0 ? std::clamp(pos / dur, 0.0, 1.0) : 0;
+        int sy = by + U(28);
+        char t1[16], t2[16]; fmtTime(pos, t1); fmtTime(dur, t2);
+        label(bx + U(24), sy, 4, U(13), "E0E0E0", t1, false);
+        label(bx + bw - U(24), sy, 6, U(13), "E0E0E0", t2, false);
+        int tx0 = bx + U(86), tx1 = bx + bw - U(86), tw = tx1 - tx0, th = U(6);
+        pill(tx0, sy - th / 2, tw, th, "FFFFFF", "A8");
+        int fw = (int)(tw * fr);
+        if (fw > 0) pill(tx0, sy - th / 2, std::max(fw, th), th, ACC, "00");
+        int kd = (g_dragKind == 1) ? U(19) : U(15);
+        if (g_emit) shape(tx0 + fw - kd / 2, sy - kd / 2, circlePath(kd), "FFFFFF", "00");
+        addHit(H_SEEK, 0, tx0 - U(10), sy - U(16), tw + U(20), U(32), tx0, tw);
+
+        int cy = by + bh - U(35);
+        int bP = U(40), bR = U(46), bPl = U(54), gap = U(10);
+        int total = bP * 2 + bR * 2 + bPl + gap * 4, x = W / 2 - total / 2;
+        addHit(H_BTN, B_PREV, x, cy - bP / 2, bP, bP); icon(I_PREV, x + bP / 2, cy, U(17), "FFFFFF"); x += bP + gap;
+        addHit(H_BTN, B_BACK, x, cy - bR / 2, bR, bR); ring(x + bR / 2, cy, U(34)); label(x + bR / 2, cy, 5, U(12), "FFFFFF", "-10", true); x += bR + gap;
+        addHit(H_BTN, B_PLAY, x, cy - bPl / 2, bPl, bPl);
+        if (g_emit) shape(x, cy - bPl / 2, circlePath(bPl), "FFFFFF", "00");
+        icon(c_pause ? I_PLAY : I_PAUSE, x + bPl / 2 + (c_pause ? U(2) : 0), cy, U(20), "141414"); x += bPl + gap;
+        addHit(H_BTN, B_FWD, x, cy - bR / 2, bR, bR); ring(x + bR / 2, cy, U(34)); label(x + bR / 2, cy, 5, U(12), "FFFFFF", "+10", true); x += bR + gap;
+        addHit(H_BTN, B_NEXT, x, cy - bP / 2, bP, bP); icon(I_NEXT, x + bP / 2, cy, U(17), "FFFFFF");
+
+        int lx = bx + U(22);                                             // left: volume + brightness
+        addHit(H_BTN, B_VOL, lx, cy - U(20), U(40), U(40)); icon(I_SPK, lx + U(20), cy, U(20), s_mute ? "808080" : "FFFFFF");
+        addHit(H_BTN, B_BRI, lx + U(46), cy - U(20), U(40), U(40)); icon(I_SUN, lx + U(66), cy, U(21), "FFFFFF");
+
+        int rx = bx + bw - U(22), ph = U(32);                            // right: speed / subtitles / audio / more
+        auto rp = [&](int id, const char* txt, int w, bool active) {
+            rx -= w;
+            addHit(H_BTN, id, rx, cy - ph / 2, w, ph);
+            pill(rx, cy - ph / 2, w, ph, "FFFFFF", active ? "98" : "D8");
+            label(rx + w / 2, cy, 5, U(13), "FFFFFF", txt, true);
+            rx -= U(8);
+        };
+        rp(B_MORE, "...", U(44), false);
+        rp(B_AUD, "Audio", U(64), g_panel == P_AUD);
+        rp(B_SUB, "CC", U(46), g_panel == P_SUB);
+        char sp[16]; snprintf(sp, 16, "%gx", s_speed);
+        rp(B_SPEED, sp, U(58), g_panel == P_SPEED);
+    } else if (vis) {                                                    // ---------- photo bar ----------
+        static const int ids[8] = {B_PREV, B_NEXT, B_ZOUT, B_ZPILL, B_ZIN, B_ROT, B_BRI, B_MORE};
+        int wd[8] = {U(44), U(44), U(40), U(74), U(40), U(72), U(44), U(44)}, gap = U(8), tot = U(36);
+        for (int i = 0; i < 8; i++) tot += wd[i] + (i ? gap : 0);
+        int bh = U(62), bx = (W - tot) / 2, by = H - U(22) - bh, cy = by + bh / 2, x = bx + U(18);
+        barTop = by;
+        if (g_emit) shape(bx, by, rrPath(tot, bh, U(28)), "141414", "38");
+        addHit(H_PANEL, 0, bx, by, tot, bh);
+        for (int i = 0; i < 8; i++) {
+            int id = ids[i], w = wd[i], hh = U(36);
+            addHit(H_BTN, id, x, cy - hh / 2, w, hh);
+            if (id == B_PREV) icon(I_PREV, x + w / 2, cy, U(16), "FFFFFF");
+            else if (id == B_NEXT) icon(I_NEXT, x + w / 2, cy, U(16), "FFFFFF");
+            else if (id == B_BRI) icon(I_SUN, x + w / 2, cy, U(21), "FFFFFF");
+            else {
+                pill(x, cy - hh / 2, w, hh, "FFFFFF", (id == B_BRI && g_panel == P_BRI) ? "98" : "D8");
+                char t[24];
+                if (id == B_ZOUT) snprintf(t, 24, "-");
+                else if (id == B_ZIN) snprintf(t, 24, "+");
+                else if (id == B_ROT) snprintf(t, 24, "Rotate");
+                else if (id == B_MORE) snprintf(t, 24, "...");
+                else if (s_zoom <= 0.001) snprintf(t, 24, "Fit");
+                else snprintf(t, 24, "%d%%", (int)(100 * pow(2.0, s_zoom)));
+                label(x + w / 2, cy, 5, (id == B_ZOUT || id == B_ZIN) ? U(18) : U(13), "FFFFFF", t, true);
+            }
+            x += w + gap;
+        }
+    }
+    if (g_panel && vis) {                                                // ---------- slider panel ----------
+        Row rows[8];
+        int nr = panelRows(g_panel, rows);
+        int pw = U(340), ph = U(20);
+        for (int i = 0; i < nr; i++) ph += rows[i].type == 0 ? U(56) : U(46);
+        int px = std::clamp(g_panelAnchor - pw / 2, U(12), std::max(U(12), W - pw - U(12))), py = barTop - U(12) - ph, yy = py + U(12);
+        if (g_emit) shape(px, py, rrPath(pw, ph, U(22)), "141414", "30");
+        addHit(H_PANEL, 1, px, py, pw, ph);
+        for (int i = 0; i < nr; i++) {
+            Row& r = rows[i];
+            if (r.type == 0) {
+                char vb[32]; fmtVal(r.fmt, r.v, vb);
+                label(px + U(22), yy + U(14), 4, U(13), "D0D0D0", r.label, false);
+                label(px + pw - U(22), yy + U(14), 6, U(13), "FFFFFF", vb, true);
+                addHit(H_RESET, r.id, px + pw - U(120), yy, U(110), U(28));
+                int tx = px + U(22), tw = pw - U(44), ty = yy + U(40), th = U(6);
+                double f = std::clamp((r.v - r.mn) / (r.mx - r.mn), 0.0, 1.0);
+                int fw = (int)(tw * f), kd = (g_dragKind == 2 && g_dragId == r.id) ? U(20) : U(16);
+                pill(tx, ty - th / 2, tw, th, "FFFFFF", "A8");
+                if (fw > 0) pill(tx, ty - th / 2, std::max(fw, th), th, ACC, "00");
+                if (g_emit) shape(tx + fw - kd / 2, ty - kd / 2, circlePath(kd), "FFFFFF", "00");
+                addHit(H_SLIDER, r.id, tx - U(8), ty - U(16), tw + U(16), U(32), tx, tw);
+                yy += U(56);
+            } else {
+                pill(px + U(16), yy + U(4), pw - U(32), U(36), "FFFFFF", "D8");
+                label(px + pw / 2, yy + U(22), 5, U(13), "FFFFFF", r.label, true);
+                addHit(H_ROW, r.id, px + U(16), yy + U(4), pw - U(32), U(36));
+                yy += U(46);
+            }
+        }
+    }
+    if (toastActive() && g_isVid) {                                      // ---------- resume popup (bottom centre) ----------
+        g_cur = &A2;
+        int tw = U(390), th = U(46), tx = (W - tw) / 2, ty = barTop - U(14) - th;
+        if (!vis) ty = H - U(26) - th;
+        char t1[16], msg[64]; fmtTime(g_toastPos, t1);
+        snprintf(msg, sizeof msg, "Resumed at %s", t1);
+        if (g_emit) shape(tx, ty, rrPath(tw, th, th / 2), "141414", "30");
+        label(tx + U(22), ty + th / 2, 4, U(14), "FFFFFF", msg, false);
+        int bh = U(30), by2 = ty + (th - bh) / 2, wOk = U(48), wSt = U(100), bx2 = tx + tw - U(10) - wOk;
+        pill(bx2, by2, wOk, bh, "FFFFFF", "D8");
+        label(bx2 + wOk / 2, by2 + bh / 2, 5, U(13), "FFFFFF", "OK", true);
+        addHit(H_BTN, B_TOK, bx2, by2, wOk, bh);
+        bx2 -= U(8) + wSt;
+        pill(bx2, by2, wSt, bh, ACC, "00");
+        label(bx2 + wSt / 2, by2 + bh / 2, 5, U(13), "141414", "Start over", true);
+        addHit(H_BTN, B_TSTART, bx2, by2, wSt, bh);
+        g_cur = &A;
+    }
+#undef U
+}
+
+static void clearOverlays() {
+    const char* a1[] = {"osd-overlay", "1", "none", "", 0};
+    const char* a2[] = {"osd-overlay", "2", "none", "", 0};
+    p_mpv_command_async(h, 0, a1);
+    p_mpv_command_async(h, 0, a2);
+}
 static void overlay() {
     if (!g_vw) return;
-    static std::string last;
-    if (!controlsVisible()) {
-        if (g_ov) { const char* a[] = {"osd-overlay", "1", "none", "", 0}; p_mpv_command_async(h, 0, a); g_ov = false; last.clear(); }
+    static std::string last1, last2;
+    bool vis = controlsVisible(), toast = toastActive();
+    if (!vis && !toast) {
+        if (g_ov) { clearOverlays(); g_ov = false; last1.clear(); last2.clear(); }
         return;
     }
     RECT r; GetClientRect(g_vw, &r);
     int W = r.right, H = r.bottom;
-    if (W < 200 || H < 120) return;
-    int si = g_shown;
-    if (si < 0 || si >= (int)files.size()) return;
-    static char buf[7000];
-    int n = 0, fs, m = W * 4 / 100;
-    layout(W, H);
-    fs = g_fs;
-    double dur = (g_isVid && g_mode == 1) ? c_dur : 0;
-    #define EMIT(...) do { n += snprintf(buf + n, sizeof(buf) - n, __VA_ARGS__); } while (0)
-    if (dur > 0) {                               // dark scrim behind the controls
-        int top = g_rowY - g_rh / 2;
-        EMIT("{\\an7\\pos(0,%d)\\bord0\\shad0\\1c&H000000&\\1a&H90&\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}\n", top, W, W, H - top, H - top);
-    }
-    std::string nm = U8(PathFindFileNameW(files[si].c_str()));
-    for (auto& c : nm) if (c == '{' || c == '}') c = '('; else if (c == '\\') c = '/';
-    EMIT("{\\an7\\pos(%d,%d)\\fs%d\\bord2\\shad0\\1c&HFFFFFF&\\3c&H000000&\\3a&H60&}%s   %d/%d", m, m / 2, fs, nm.c_str(), si + 1, (int)files.size());
-    if (dur > 0) {
-        double pos = c_pos, f = std::clamp(pos / dur, 0.0, 1.0);
-        int fw = (int)(g_bw * f);
-        char t1[16], t2[16]; fmt(pos, t1); fmt(dur, t2);
-        EMIT("\n{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HA0&\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}", g_bx, g_by, g_bw, g_bw, g_bh, g_bh);
-        EMIT("\n{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c&HFFFFFF&\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}", g_bx, g_by, fw, fw, g_bh, g_bh);
-        EMIT("\n{\\an4\\pos(%d,%d)\\fs%d\\bord2\\shad0\\1c&HFFFFFF&\\3c&H000000&\\3a&H60&}%s / %s", m, g_rowY + g_rh / 2, fs, t1, t2);
-        char sp[16]; snprintf(sp, 16, "%gx", s_speed);
-        for (int i = 0; i < g_nb; i++) {
-            Btn& b = g_b[i];
-            int cx = b.x + b.w / 2, cy = b.y + b.h / 2, a = g_rh * 2 / 5, ox = cx - a / 2, oy = cy - a / 2;
-            char p[200];
-            const char* txt = 0;
-            switch (b.id) {
-            case B_PLAY:
-                if (c_pause) snprintf(p, 200, "m 0 0 l %d %d l 0 %d", a * 9 / 10, a / 2, a);
-                else snprintf(p, 200, "m 0 0 l %d 0 l %d %d l 0 %d m %d 0 l %d 0 l %d %d l %d %d", a * 3 / 10, a * 3 / 10, a, a, a * 7 / 10, a, a, a, a * 7 / 10, a);
-                EMIT("\n{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c&HFFFFFF&\\p1}%s{\\p0}", ox, oy, p);
-                break;
-            case B_PREV:
-                snprintf(p, 200, "m 0 0 l %d 0 l %d %d l 0 %d m %d %d l %d 0 l %d %d", a * 15 / 100, a * 15 / 100, a, a, a * 25 / 100, a / 2, a, a, a);
-                EMIT("\n{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c&HFFFFFF&\\p1}%s{\\p0}", ox, oy, p);
-                break;
-            case B_NEXT:
-                snprintf(p, 200, "m 0 0 l %d %d l 0 %d m %d 0 l %d 0 l %d %d l %d %d", a * 75 / 100, a / 2, a, a * 85 / 100, a, a, a, a * 85 / 100, a);
-                EMIT("\n{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c&HFFFFFF&\\p1}%s{\\p0}", ox, oy, p);
-                break;
-            case B_BACK: txt = "-10"; break;
-            case B_FWD: txt = "+10"; break;
-            case B_SUBS: txt = "Subtitles"; break;
-            case B_AUDIO: txt = "Audio"; break;
-            case B_SPEED: txt = sp; break;
-            case B_MORE: txt = "..."; break;
-            }
-            if (txt) EMIT("\n{\\an5\\pos(%d,%d)\\fs%d\\bord2\\shad0\\1c&HFFFFFF&\\3c&H000000&\\3a&H60&}%s", cx, cy, fs, txt);
-        }
-    }
+    if (W < 200 || H < 120 || g_shown < 0 || g_shown >= (int)files.size()) return;
+    uiBuild(W, H, true);
+    while (!A.empty() && A.back() == '\n') A.pop_back();
+    while (!A2.empty() && A2.back() == '\n') A2.pop_back();
     char ws[16], hs[16]; sprintf(ws, "%d", W); sprintf(hs, "%d", H);
-    std::string cur = std::string(buf) + "|" + ws + "x" + hs;
-    if (cur == last) return;                      // nothing changed: don't make mpv redraw the frame
-    last = cur;
-    const char* a[] = {"osd-overlay", "1", "ass-events", buf, ws, hs, 0};
-    p_mpv_command_async(h, 0, a);
+    std::string k = std::string(ws) + "x" + hs;
+    if (A.empty()) { if (!last1.empty()) { const char* a[] = {"osd-overlay", "1", "none", "", 0}; p_mpv_command_async(h, 0, a); last1.clear(); } }
+    else if (A + k != last1) {
+        last1 = A + k;
+        const char* a[] = {"osd-overlay", "1", "ass-events", A.c_str(), ws, hs, 0};
+        p_mpv_command_async(h, 0, a);
+    }
+    if (A2.empty()) { if (!last2.empty()) { const char* a[] = {"osd-overlay", "2", "none", "", 0}; p_mpv_command_async(h, 0, a); last2.clear(); } }
+    else if (A2 + k != last2) {
+        last2 = A2 + k;
+        const char* a[] = {"osd-overlay", "2", "ass-events", A2.c_str(), ws, hs, 0};
+        p_mpv_command_async(h, 0, a);
+    }
     g_ov = true;
 }
 
-static int hitBtn(int x, int y, int W, int H) {
-    if (!g_isVid || g_mode != 1 || !controlsVisible()) return 0;
-    layout(W, H);
-    for (int i = 0; i < g_nb; i++)
-        if (x >= g_b[i].x && x < g_b[i].x + g_b[i].w && y >= g_b[i].y && y < g_b[i].y + g_b[i].h) return g_b[i].id;
-    return 0;
-}
-static void btnClick(int id) {
-    Btn* b = 0;
-    for (int i = 0; i < g_nb; i++) if (g_b[i].id == id) b = &g_b[i];
-    POINT p = {b ? b->x : 0, b ? b->y : 0};
-    ClientToScreen(g_vw, &p);
-    int r = 0;
-    switch (id) {
-    case B_PREV: go(-1); break;
-    case B_NEXT: go(1); break;
-    case B_BACK: cmd("seek", "-10"); break;
-    case B_FWD: cmd("seek", "10"); break;
-    case B_PLAY: cmd("cycle", "pause"); break;
-    case B_SUBS: r = popup(menuSubs(), p.x, p.y, TPM_BOTTOMALIGN); break;
-    case B_AUDIO: r = popup(menuAudio(), p.x, p.y, TPM_BOTTOMALIGN); break;
-    case B_SPEED: r = popup(menuSpeed(), p.x, p.y, TPM_BOTTOMALIGN); break;
-    case B_MORE: r = popup(menuContext(), p.x, p.y, TPM_BOTTOMALIGN); break;
-    }
-    if (r) menuCmd(r);
-}
-
-// ======================= gestures (mouse + touchpad) =======================
-static bool ld, rd, md, skipClick;
-static int dx0, dy0, rx, ry, rmode, mx, my, downBtn;
+// ======================= input: gestures, buttons, sliders =======================
+static bool ld, rd, md, skipClick, winDrag;
+static int dx0, dy0, rx, ry, rmode, mx, my, lx, ly;
 static DWORD lastDown, lastH, navCool, tpUntil;
 static double sB, sV, sPos, sZ, hAcc, sAcc;
 
@@ -948,6 +1225,66 @@ static double zoomAt(double nz, int x, int y, int W, int H) {
     s_zoom = nz;
     viewChanged();
     return nz;
+}
+static void dragMove(int x) {
+    if (g_dragW <= 0) return;
+    double f = std::clamp((x - g_dragX0) / (double)g_dragW, 0.0, 1.0);
+    if (g_dragKind == 1) {
+        if (c_dur > 0) { g_scrub = f * c_dur; g_seekTarget = g_scrub; g_seekDirty = true; kick(); }
+    } else if (g_dragKind == 2) {
+        Row rows[8];
+        int n = panelRows(g_panel, rows);
+        for (int i = 0; i < n; i++) if (rows[i].type == 0 && rows[i].id == g_dragId) setSliderId(g_dragId, rows[i].mn + f * (rows[i].mx - rows[i].mn));
+    }
+}
+static void endDrag() {
+    if (g_dragKind == 1 && c_dur > 0) { char b[48]; snprintf(b, 48, "%.2f", g_scrub); cmd("seek", b, "absolute"); g_seekDirty = false; }
+    if (g_dragKind == 2) saveSettings();
+    g_dragKind = 0;
+}
+static void togglePanel(int p, int id) {
+    Hit* b = findBtn(id);
+    int cx = b ? b->x + b->w / 2 : clientW() / 2;
+    if (g_panel == p) closePanel(); else openPanel(p, cx);
+}
+static void btnClick(int id) {
+    Hit* b = findBtn(id);
+    int W = clientW();
+    switch (id) {
+    case B_PREV: go(-1); break;
+    case B_NEXT: go(1); break;
+    case B_BACK: cmd("seek", "-10"); break;
+    case B_FWD: cmd("seek", "10"); break;
+    case B_PLAY: cmd("cycle", "pause"); break;
+    case B_VOL: togglePanel(P_VOL, id); break;
+    case B_BRI: togglePanel(P_BRI, id); break;
+    case B_SPEED: togglePanel(P_SPEED, id); break;
+    case B_SUB: togglePanel(P_SUB, id); break;
+    case B_AUD: togglePanel(P_AUD, id); break;
+    case B_MORE: {
+        POINT p = {b ? b->x : W / 2, b ? b->y : 0};
+        ClientToScreen(g_vw, &p);
+        int r = popup(menuContext(), p.x, p.y, TPM_BOTTOMALIGN);
+        if (r) menuCmd(r);
+        break;
+    }
+    case B_ZOUT: { double z = std::max(-1.0, s_zoom - 0.25); s_zoom = z; if (z <= 0.001) s_px = s_py = 0; viewChanged(); break; }
+    case B_ZIN: s_zoom = std::min(6.0, s_zoom + 0.25); viewChanged(); break;
+    case B_ZPILL: s_zoom = s_px = s_py = 0; viewChanged(); break;
+    case B_ROT: act("rotate"); break;
+    case B_TSTART: cmd("seek", "0", "absolute"); g_toastUntil = 0; break;
+    case B_TOK: g_toastUntil = 0; break;
+    }
+}
+static void uiClick(int kind, int id) {
+    if (kind == H_BTN) btnClick(id);
+    else if (kind == H_ROW) rowAction(id);
+    else if (kind == H_RESET) {
+        Row rows[8];
+        int n = panelRows(g_panel, rows);
+        for (int i = 0; i < n; i++) if (rows[i].type == 0 && rows[i].id == id) setSliderId(id, rows[i].def);
+        saveSettings();
+    }
 }
 
 static void onWheel(UINT t, WPARAM wp, LPARAM lp) {
@@ -968,15 +1305,17 @@ static void onWheel(UINT t, WPARAM wp, LPARAM lp) {
 
     if (t == WM_MOUSEHWHEEL) {                   // two-finger horizontal swipe
         if (s_zoom > 0.01) { s_px = std::clamp(s_px - d * 100.0 / (W * zf), -3.0, 3.0); viewChanged(); return; }
-        if (o_inv) d = -d;
+        double dh = d;
+        if (g_isVid) dh = -dh;                   // video seek: swipe direction matches the timeline
+        if (o_inv) dh = -dh;
         if (!g_isVid) {
             if (now - lastH > 250) hAcc = 0;
             lastH = now;
             if (now < navCool) { navCool = now + 250; return; }
-            hAcc += d * 120;
+            hAcc += dh * 120;
             if (fabs(hAcc) > std::max(60, o_swipe)) { go(hAcc > 0 ? 1 : -1); hAcc = 0; navCool = now + 450; }
         } else {
-            sAcc += d * 5;
+            sAcc += dh * 5;
             if (fabs(sAcc) >= 1) { snprintf(b, 96, "%.2f", sAcc); cmd("seek", b, "relative+keyframes"); sAcc = 0; }
         }
         return;
@@ -986,16 +1325,20 @@ static void onWheel(UINT t, WPARAM wp, LPARAM lp) {
         osdLater("Zoom %d%%", (int)(100 * pow(2.0, nz)));
         return;
     }
-    if (!tp) {                                   // classic mouse wheel
-        if (!g_isVid) {
+    if (!g_isVid) {                              // photo
+        if (!tp) {
             double nz = zoomAt(s_zoom + 0.15 * d, pt.x, pt.y, W, H);
             osdLater("Zoom %d%%", (int)(100 * pow(2.0, nz)));
-        } else if (shift) { snprintf(b, 96, "%d", (int)(d * 5)); cmd("seek", b); }
-        else { setVol(s_vol + d * 5); osdLater("Volume %d%%", (int)floor(s_vol + 0.5)); kick(); }
+        } else if (s_zoom > 0.01) { s_py = std::clamp(s_py + d * 100.0 / (H * zf), -3.0, 3.0); viewChanged(); }
         return;
     }
-    if (s_zoom > 0.01) { s_py = std::clamp(s_py + d * 100.0 / (H * zf), -3.0, 3.0); viewChanged(); }
-    else if (g_isVid) { setVol(s_vol + d * 3); osdLater("Volume %d%%", (int)floor(s_vol + 0.5)); kick(); }
+    if (shift && !tp) { snprintf(b, 96, "%d", (int)(d * 5)); cmd("seek", b); return; }
+    // video: right half = volume, left half = brightness (touchpad: swipe up = increase)
+    double dv = d;
+    if (tp) { dv = -d; if (o_invv) dv = -dv; }
+    if (pt.x > W / 2) { setVol(s_vol + dv * (tp ? 3 : 5)); osdLater("Volume %d%%", (int)floor(s_vol + 0.5)); }
+    else { setBright(s_bright + dv * (tp ? 3 : 4)); osdLater("Brightness %d", (int)s_bright); }
+    kick();
 }
 
 static void onInput(UINT t, WPARAM wp, LPARAM lp) {
@@ -1008,18 +1351,33 @@ static void onInput(UINT t, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN: {
         int vk = (int)wp;
         if (GetKeyState(VK_CONTROL) < 0 || GetKeyState(VK_MENU) < 0) break;
-        if (vk < 256 && !KM[vk].empty()) act(KM[vk]);
+        if (vk == VK_ESCAPE && g_panel) { closePanel(); break; }
+        std::string* km = KMS[g_isVid ? 1 : 0];
+        if (vk < 256 && !km[vk].empty()) act(km[vk]);
         showUI();
         break;
     }
     case WM_MOUSEMOVE:
         showUI();
+        if (g_dragKind) { if (!(g_mmWp & MK_LBUTTON)) endDrag(); else dragMove(x); break; }
         if (md) {
             double zf = pow(2.0, s_zoom);
             s_px = std::clamp(s_px + (x - mx) / (W * zf), -3.0, 3.0);
             s_py = std::clamp(s_py + (y - my) / (H * zf), -3.0, 3.0);
             mx = x; my = y;
             viewChanged();
+        }
+        if (ld && !skipClick && !winDrag && (g_mmWp & MK_LBUTTON)) {
+            if (s_zoom > 0.01) {                                   // zoomed in: drag pans
+                double zf = pow(2.0, s_zoom);
+                s_px = std::clamp(s_px + (x - lx) / (W * zf), -3.0, 3.0);
+                s_py = std::clamp(s_py + (y - ly) / (H * zf), -3.0, 3.0);
+                lx = x; ly = y;
+                viewChanged();
+            } else if (!c_full && (abs(x - dx0) > 6 || abs(y - dy0) > 6)) {   // otherwise drag moves the window
+                winDrag = true;
+                PostMessageW(g_vw, WM_SYSCOMMAND, SC_MOVE | 2, 0);
+            }
         }
         if (rd) {
             int dx = x - rx, dy = y - ry;
@@ -1030,7 +1388,7 @@ static void onInput(UINT t, WPARAM wp, LPARAM lp) {
             }
             if (rmode == 1) {
                 setBright(sB - dy * 200.0 / H);
-                osdLater("Brightness %d", (int)floor(s_bright + 0.5)); kick();
+                osdLater("Brightness %d", (int)s_bright); kick();
             } else if (rmode == 2) {
                 if (g_isVid) { setVol(sV - dy * 150.0 / H); osdLater("Volume %d%%", (int)floor(s_vol + 0.5)); kick(); }
                 else { double z = zoomAt(sZ - dy * 3.0 / H, W / 2, H / 2, W, H); osdLater("Zoom %d%%", (int)(100 * pow(2.0, z))); }
@@ -1042,28 +1400,39 @@ static void onInput(UINT t, WPARAM wp, LPARAM lp) {
         break;
     case WM_LBUTTONDOWN: {
         DWORD now = GetTickCount();
-        skipClick = false;
-        downBtn = hitBtn(x, y, W, H);
-        if (downBtn) { lastDown = 0; skipClick = true; }
-        else if (lastDown && now - lastDown < GetDoubleClickTime() && abs(x - dx0) < 8 && abs(y - dy0) < 8) {
+        skipClick = false; winDrag = false; ld = true; downBtn_reset:
+        g_downKind = 0;
+        dx0 = x; dy0 = y; lx = x; ly = y;
+        uiBuild(W, H, false);
+        Hit* hh = (controlsVisible() || toastActive()) ? hitAt(x, y) : 0;
+        if (hh) {
+            if (hh->kind == H_SLIDER) {
+                g_dragKind = 2; g_dragId = hh->id; g_dragX0 = hh->tx; g_dragW = hh->tw; skipClick = true; dragMove(x);
+                break;
+            }
+            if (hh->kind == H_SEEK) {
+                g_dragKind = 1; g_dragX0 = hh->tx; g_dragW = hh->tw; g_scrub = c_pos; skipClick = true; dragMove(x);
+                break;
+            }
+            if (hh->kind == H_BTN || hh->kind == H_ROW || hh->kind == H_RESET) { g_downKind = hh->kind; g_downId = hh->id; skipClick = true; lastDown = 0; break; }
+            if (hh->kind == H_PANEL) { if (hh->id == 0 && g_panel) closePanel(); skipClick = true; break; }
+        }
+        if (g_panel) { closePanel(); skipClick = true; break; }
+        if (lastDown && now - lastDown < GetDoubleClickTime() && abs(x - dx0) < 8 && abs(y - dy0) < 8) {
             if (g_isVid) cmd("cycle", "pause");   // undo the pause toggle from the first click
             act("fullscreen");
             lastDown = 0; skipClick = true;
         } else lastDown = now;
-        dx0 = x; dy0 = y; ld = true;
         break;
     }
     case WM_LBUTTONUP:
-        if (ld && downBtn) {
-            if (hitBtn(x, y, W, H) == downBtn) btnClick(downBtn);
-        } else if (ld && !skipClick && abs(x - dx0) < 5 && abs(y - dy0) < 5 && g_isVid) {
-            layout(W, H);
-            if (y >= g_by - g_bh * 3 && x >= g_bx - 8 && x <= g_bx + g_bw + 8 && controlsVisible()) {
-                double p = std::clamp((x - g_bx) * 100.0 / g_bw, 0.0, 100.0);
-                snprintf(b, 96, "%.2f", p); cmd("seek", b, "absolute-percent");
-            } else cmd("cycle", "pause");
-        }
-        ld = false; downBtn = 0; showUI();
+        if (g_dragKind) endDrag();
+        else if (g_downKind) {
+            uiBuild(W, H, false);
+            Hit* hh = hitAt(x, y);
+            if (hh && hh->kind == g_downKind && hh->id == g_downId) uiClick(hh->kind, hh->id);
+        } else if (ld && !skipClick && !winDrag && abs(x - dx0) < 5 && abs(y - dy0) < 5 && g_isVid) cmd("cycle", "pause");
+        ld = false; g_downKind = 0; winDrag = false; showUI();
         break;
     case WM_RBUTTONDOWN:
         rd = true; rx = x; ry = y; rmode = 0;
@@ -1099,8 +1468,10 @@ static LRESULT CALLBACK HookProc(int c, WPARAM wp, LPARAM lp) {
             g_mmLp = m->lParam; g_mmWp = m->wParam;
             if (InterlockedExchange(&g_mmPending, 1) == 0) PostMessageW(g_mw, 0x8000 + WM_MOUSEMOVE, 0, 0);
         } else if (t == WM_KEYDOWN || t == WM_LBUTTONDOWN || t == WM_LBUTTONUP || t == WM_RBUTTONDOWN ||
-                   t == WM_RBUTTONUP || t == WM_MBUTTONDOWN || t == WM_MBUTTONUP || t == WM_MOUSEWHEEL || t == WM_MOUSEHWHEEL)
+                   t == WM_RBUTTONUP || t == WM_MBUTTONDOWN || t == WM_MBUTTONUP || t == WM_MOUSEWHEEL || t == WM_MOUSEHWHEEL) {
+            if (t != WM_KEYDOWN && t != WM_MOUSEWHEEL && t != WM_MOUSEHWHEEL) { g_mmLp = m->lParam; g_mmWp = m->wParam; }
             PostMessageW(g_mw, 0x8000 + t, m->wParam, m->lParam);
+        }
     }
     return CallNextHookEx(0, c, wp, lp);
 }
@@ -1120,7 +1491,7 @@ static void hookIfNeeded() {
 static void wake(void*) { PostMessageW(g_mw, WM_USER + 1, 0, 0); }
 
 // Applies the latest state, rate-limited. Called after every input message AND from a fallback timer
-// (WM_TIMER is starved while input messages keep arriving, so relying on it alone made everything feel late).
+// (WM_TIMER is starved while input messages keep arriving).
 static void pump() {
     double t = nowms();
     DWORD now = GetTickCount();
@@ -1128,8 +1499,9 @@ static void pump() {
     if (g_viewDirty && t - g_tView >= 10) { sendView(); g_viewDirty = false; g_tView = t; }
     if (g_seekDirty && t - g_tSeek >= 60) { char b[48]; snprintf(b, 48, "%.2f", g_seekTarget); cmd("seek", b, "absolute+keyframes"); g_seekDirty = false; g_tSeek = t; }
     if (g_osdDirty && t - g_tOsd >= 70) { osd(g_osdBuf); g_osdDirty = false; g_tOsd = t; }
-    if (t - g_tOv >= 100) { overlay(); g_tOv = t; }
-    if (g_pending < 0 && !g_viewDirty && !g_seekDirty && !g_osdDirty && g_timerOn) { KillTimer(g_mw, 2); g_timerOn = false; }
+    if (t - g_tOv >= (g_dragKind ? 16.0 : 100.0)) { overlay(); g_tOv = t; }
+    if (g_pending < 0 && !g_viewDirty && !g_seekDirty && !g_osdDirty && !g_dragKind && g_timerOn) { KillTimer(g_mw, 2); g_timerOn = false; }
+    else if (g_dragKind) kick();
 }
 
 static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
@@ -1147,7 +1519,9 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
                     if (!strcmp(p->name, "time-pos")) c_pos = v; else if (!strcmp(p->name, "duration")) c_dur = v;
                 } else if (p->format == MPV_FORMAT_FLAG) {
                     int v = *(int*)p->data;
-                    if (!strcmp(p->name, "pause")) c_pause = v != 0; else if (!strcmp(p->name, "eof-reached")) c_eof = v != 0;
+                    if (!strcmp(p->name, "pause")) c_pause = v != 0;
+                    else if (!strcmp(p->name, "eof-reached")) c_eof = v != 0;
+                    else if (!strcmp(p->name, "fullscreen")) c_full = v != 0;
                 } else if (p->format == MPV_FORMAT_NONE) {
                     if (!strcmp(p->name, "duration")) c_dur = 0; else if (!strcmp(p->name, "time-pos")) c_pos = 0;
                     else if (!strcmp(p->name, "eof-reached")) c_eof = false;
@@ -1211,68 +1585,77 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_TIMER) {
         if (wp == 2) { pump(); return 0; }
         hookIfNeeded();
-        overlay();
-        static DWORD lastAuto;
-        if (o_autonext && g_isVid && idx < (int)files.size() - 1 && GetTickCount() - lastAuto > 1500 && c_eof) {
-            lastAuto = GetTickCount();
-            go(1);
+        static int tick;
+        if (++tick % 50 == 0) saveResume();       // about every 10 s
+        pump();
+        if (o_autonext && g_isVid && idx < (int)files.size() - 1 && c_eof) {
+            static DWORD lastAuto;
+            if (GetTickCount() - lastAuto > 1500) { lastAuto = GetTickCount(); go(1); }
         }
         return 0;
     }
     return DefWindowProcW(w, m, wp, lp);
 }
 
-// ======================= settings window =======================
-struct Opt { const wchar_t* lbl; int type; void* p; int page; };   // type 0 checkbox, 1 number, 2 text
+// ======================= settings window (photo OR video, never both) =======================
+struct Opt { const wchar_t* lbl; int type; void* p; int mask; };   // type 0 checkbox, 1 number, 2 text; mask 1 photo, 2 video
 static Opt OPTS[] = {
-    {L"Play the next file automatically when a video ends", 0, &o_autonext, 0},
-    {L"Remember the last volume", 0, &o_remvol, 0},
-    {L"Default volume (0-130)", 1, &o_vol, 0},
-    {L"Start in fullscreen", 0, &o_startfs, 0},
-    {L"Keep window always on top", 0, &o_ontop, 0},
-    {L"Hide controls after (seconds)", 1, &o_uisec, 0},
-    {L"Preload next / previous files in the background", 0, &o_preload, 0},
-    {L"Invert touchpad swipe direction", 0, &o_inv, 0},
-    {L"Touchpad swipe distance (smaller = more sensitive)", 1, &o_swipe, 0},
+    // ---- photo viewer ----
     {L"High quality scaling (uncheck = fastest mode for very old GPUs)", 0, &o_hq, 1},
     {L"Ultra quality: heaviest scaler, needs a decent GPU", 0, &o_ultra, 1},
-    {L"Smooth motion for video (display-resample + interpolation)", 0, &o_smooth, 1},
-    {L"Light debanding for video", 0, &o_deband, 1},
-    {L"Hardware video decoding", 0, &o_hwdec, 1},
     {L"Colour-managed display (ICC profile, slower start)", 0, &o_icc, 1},
-    {L"Use gpu-next renderer (better HDR, slower; applies on next open)", 0, &o_next, 1},
-    {L"Subtitle size (default 40)", 1, &o_subsize, 1},
-    {L"Preferred subtitle language (e.g. en)", 2, o_slang, 1},
-    {L"Preferred audio language (e.g. en)", 2, o_alang, 1}};
+    {L"Touchpad swipe distance for next / previous (smaller = more sensitive)", 1, &o_swipe, 1},
+    // ---- video player ----
+    {L"Hardware (GPU) decoding - picks the best method for this PC", 0, &o_hwdec, 2},
+    {L"Smooth motion (display-resample + interpolation, heavier)", 0, &o_smooth, 2},
+    {L"Light debanding", 0, &o_deband, 2},
+    {L"Keep stereo audio as stereo (downmix surround sound)", 0, &o_stereo, 2},
+    {L"Remember playback position of each video", 0, &o_resume, 2},
+    {L"Play the next video automatically", 0, &o_autonext, 2},
+    {L"Remember the last volume", 0, &o_remvol, 2},
+    {L"Default volume (0-130)", 1, &o_vol, 2},
+    {L"Preferred subtitle language (e.g. en)", 2, o_slang, 2},
+    {L"Preferred audio language (e.g. en)", 2, o_alang, 2},
+    {L"Reverse two-finger scroll direction (volume / brightness)", 0, &o_invv, 2},
+    // ---- both ----
+    {L"Reverse two-finger swipe direction (seek / next-previous)", 0, &o_inv, 3},
+    {L"Preload next / previous files in the background", 0, &o_preload, 3},
+    {L"Hide controls after (seconds)", 1, &o_uisec, 3},
+    {L"Start in fullscreen", 0, &o_startfs, 3},
+    {L"Keep window always on top", 0, &o_ontop, 3},
+    {L"Use gpu-next renderer (better HDR, slower; applies on next open)", 0, &o_next, 3}};
 static const int NOPT = sizeof(OPTS) / sizeof(*OPTS);
 static HWND g_tab, g_lv, g_status;
-static std::vector<HWND> g_pg[3];
+static std::vector<HWND> g_pg[2];
 static HFONT g_font;
-static int g_dpi = 96, g_cap = -1;
+static int g_dpi = 96, g_cap = -1, g_setMode = 1;          // g_setMode: 1 photo, 2 video
+static int g_la[64], g_nla;                                // list row -> ACTS index
 static bool g_building;
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
 static BOOL CALLBACK setFontCb(HWND c, LPARAM) { SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE); return TRUE; }
+static std::string* setKM() { return KMS[g_setMode == 2 ? 1 : 0]; }
 
 static void showPage(int p) {
-    for (int i = 0; i < 3; i++) for (HWND c : g_pg[i]) ShowWindow(c, i == p ? SW_SHOW : SW_HIDE);
+    for (int i = 0; i < 2; i++) for (HWND c : g_pg[i]) ShowWindow(c, i == p ? SW_SHOW : SW_HIDE);
 }
 static void refreshList() {
-    for (int i = 0; i < NACT; i++) {
+    std::string* km = setKM();
+    for (int i = 0; i < g_nla; i++) {
         std::wstring keys;
         for (int vk = 1; vk < 256; vk++)
-            if (KM[vk] == ACTS[i].id) { if (!keys.empty()) keys += L", "; keys += nameOf(vk); }
+            if (km[vk] == ACTS[g_la[i]].id) { if (!keys.empty()) keys += L", "; keys += nameOf(vk); }
         ListView_SetItemText(g_lv, i, 1, (LPWSTR)keys.c_str());
     }
 }
 static void startCapture() {
     int sel = ListView_GetNextItem(g_lv, -1, LVNI_SELECTED);
-    if (sel < 0) { SetWindowTextW(g_status, L"Select an action first."); return; }
+    if (sel < 0 || sel >= g_nla) { SetWindowTextW(g_status, L"Select an action first."); return; }
     g_cap = sel;
-    std::wstring s = std::wstring(L"Press the new key for \"") + ACTS[sel].label + L"\"  (Esc = cancel)";
+    std::wstring s = std::wstring(L"Press the new key for \"") + ACTS[g_la[sel]].label + L"\"  (Esc = cancel)";
     SetWindowTextW(g_status, s.c_str());
     SetFocus(g_set);
 }
-static void clearKeysOf(const char* a) { for (int vk = 1; vk < 256; vk++) if (KM[vk] == a) KM[vk].clear(); }
+static void clearKeysOf(const char* a) { std::string* km = setKM(); for (int vk = 1; vk < 256; vk++) if (km[vk] == a) km[vk].clear(); }
 
 static LRESULT CALLBACK SetProc(HWND hw, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
@@ -1283,43 +1666,48 @@ static LRESULT CALLBACK SetProc(HWND hw, UINT m, WPARAM wp, LPARAM lp) {
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
         if (!g_font) g_font = CreateFontIndirectW(&ncm.lfMessageFont);
         g_building = true;
-        g_tab = CreateWindowExW(0, WC_TABCONTROLW, 0, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, S(10), S(10), S(565), S(450), hw, (HMENU)1, g_inst, 0);
-        static const wchar_t* tn[3] = {L"General", L"Video && Image", L"Shortcuts"};
-        for (int i = 0; i < 3; i++) { TCITEMW ti = {}; ti.mask = TCIF_TEXT; ti.pszText = (LPWSTR)tn[i]; TabCtrl_InsertItem(g_tab, i, &ti); }
-        int y[2] = {S(50), S(50)};
+        g_tab = CreateWindowExW(0, WC_TABCONTROLW, 0, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, S(10), S(10), S(575), S(570), hw, (HMENU)1, g_inst, 0);
+        static const wchar_t* tn1[2] = {L"Photo viewer", L"Photo shortcuts"};
+        static const wchar_t* tn2[2] = {L"Video player", L"Video shortcuts"};
+        for (int i = 0; i < 2; i++) { TCITEMW ti = {}; ti.mask = TCIF_TEXT; ti.pszText = (LPWSTR)(g_setMode == 2 ? tn2[i] : tn1[i]); TabCtrl_InsertItem(g_tab, i, &ti); }
+        int y = S(48);
         for (int i = 0; i < NOPT; i++) {
             Opt& o = OPTS[i];
-            int pg = o.page; HWND c;
+            if (!(o.mask & g_setMode)) continue;
+            HWND c;
             if (o.type == 0) {
-                c = CreateWindowExW(0, L"BUTTON", o.lbl, WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP, S(30), y[pg], S(530), S(24), hw, (HMENU)(INT_PTR)(2000 + i), g_inst, 0);
+                c = CreateWindowExW(0, L"BUTTON", o.lbl, WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP, S(30), y, S(540), S(24), hw, (HMENU)(INT_PTR)(2000 + i), g_inst, 0);
                 SendMessageW(c, BM_SETCHECK, *(int*)o.p ? BST_CHECKED : BST_UNCHECKED, 0);
-                g_pg[pg].push_back(c);
+                g_pg[0].push_back(c);
             } else {
-                HWND l = CreateWindowExW(0, L"STATIC", o.lbl, WS_CHILD, S(30), y[pg] + S(3), S(400), S(22), hw, 0, g_inst, 0);
+                HWND l = CreateWindowExW(0, L"STATIC", o.lbl, WS_CHILD, S(30), y + S(3), S(410), S(22), hw, 0, g_inst, 0);
                 wchar_t v[32];
                 if (o.type == 1) _snwprintf(v, 32, L"%d", *(int*)o.p); else { wcsncpy(v, (wchar_t*)o.p, 31); v[31] = 0; }
-                c = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", v, WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP | (o.type == 1 ? ES_NUMBER : 0), S(440), y[pg], S(110), S(24), hw, (HMENU)(INT_PTR)(2000 + i), g_inst, 0);
-                g_pg[pg].push_back(l); g_pg[pg].push_back(c);
+                c = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", v, WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP | (o.type == 1 ? ES_NUMBER : 0), S(450), y, S(100), S(24), hw, (HMENU)(INT_PTR)(2000 + i), g_inst, 0);
+                g_pg[0].push_back(l); g_pg[0].push_back(c);
             }
-            y[pg] += S(34);
+            y += S(29);
         }
-        g_lv = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, 0, WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, S(25), S(45), S(535), S(340), hw, (HMENU)3000, g_inst, 0);
+        g_lv = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, 0, WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, S(25), S(45), S(545), S(440), hw, (HMENU)3000, g_inst, 0);
         ListView_SetExtendedListViewStyle(g_lv, LVS_EX_FULLROWSELECT);
         LVCOLUMNW col = {}; col.mask = LVCF_TEXT | LVCF_WIDTH;
-        col.pszText = (LPWSTR)L"Action"; col.cx = S(290); ListView_InsertColumn(g_lv, 0, &col);
+        col.pszText = (LPWSTR)L"Action"; col.cx = S(300); ListView_InsertColumn(g_lv, 0, &col);
         col.pszText = (LPWSTR)L"Key"; col.cx = S(220); ListView_InsertColumn(g_lv, 1, &col);
-        for (int i = 0; i < NACT; i++) {
-            LVITEMW it = {}; it.mask = LVIF_TEXT; it.iItem = i; it.pszText = (LPWSTR)ACTS[i].label;
+        g_nla = 0;
+        for (int i = 0; i < NACT && g_nla < 64; i++) {
+            if (!(ACTS[i].mask & g_setMode)) continue;
+            LVITEMW it = {}; it.mask = LVIF_TEXT; it.iItem = g_nla; it.pszText = (LPWSTR)ACTS[i].label;
             ListView_InsertItem(g_lv, &it);
+            g_la[g_nla++] = i;
         }
         refreshList();
-        g_pg[2].push_back(g_lv);
+        g_pg[1].push_back(g_lv);
         static const wchar_t* bt[3] = {L"Change key...", L"Clear", L"Reset all"};
         for (int i = 0; i < 3; i++)
-            g_pg[2].push_back(CreateWindowExW(0, L"BUTTON", bt[i], WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, S(25) + i * S(130), S(395), S(120), S(28), hw, (HMENU)(INT_PTR)(3001 + i), g_inst, 0));
-        g_status = CreateWindowExW(0, L"STATIC", L"Select an action, then press \"Change key...\" (or double-click it).", WS_CHILD, S(25), S(430), S(540), S(22), hw, 0, g_inst, 0);
-        g_pg[2].push_back(g_status);
-        CreateWindowExW(0, L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP, S(475), S(472), S(100), S(30), hw, (HMENU)IDCANCEL, g_inst, 0);
+            g_pg[1].push_back(CreateWindowExW(0, L"BUTTON", bt[i], WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, S(25) + i * S(130), S(495), S(120), S(28), hw, (HMENU)(INT_PTR)(3001 + i), g_inst, 0));
+        g_status = CreateWindowExW(0, L"STATIC", L"Select an action, then press \"Change key...\" (or double-click it).", WS_CHILD, S(25), S(535), S(545), S(22), hw, 0, g_inst, 0);
+        g_pg[1].push_back(g_status);
+        CreateWindowExW(0, L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP, S(485), S(592), S(100), S(30), hw, (HMENU)IDCANCEL, g_inst, 0);
         EnumChildWindows(hw, setFontCb, 0);
         showPage(0);
         g_building = false;
@@ -1337,12 +1725,11 @@ static LRESULT CALLBACK SetProc(HWND hw, UINT m, WPARAM wp, LPARAM lp) {
         if (id == 3001) { startCapture(); return 0; }
         if (id == 3002) {
             int sel = ListView_GetNextItem(g_lv, -1, LVNI_SELECTED);
-            if (sel >= 0) { clearKeysOf(ACTS[sel].id); refreshList(); saveSettings(); }
+            if (sel >= 0 && sel < g_nla) { clearKeysOf(ACTS[g_la[sel]].id); refreshList(); saveSettings(); }
             return 0;
         }
         if (id == 3003) {
-            for (auto& s : KM) s.clear();
-            applyDefaultKeys(false); refreshList(); saveSettings();
+            applyDefaultKeys(g_setMode == 2 ? 1 : 0); refreshList(); saveSettings();
             SetWindowTextW(g_status, L"Shortcuts reset to defaults.");
             return 0;
         }
@@ -1363,9 +1750,10 @@ static LRESULT CALLBACK SetProc(HWND hw, UINT m, WPARAM wp, LPARAM lp) {
             int vk = (int)wp;
             if (vk == VK_ESCAPE) { g_cap = -1; SetWindowTextW(g_status, L"Cancelled."); return 0; }
             if (nameOf(vk).empty()) return 0;
-            clearKeysOf(ACTS[g_cap].id);
-            KM[vk] = ACTS[g_cap].id;
-            std::wstring s = std::wstring(L"\"") + ACTS[g_cap].label + L"\" = " + nameOf(vk);
+            const Act& a = ACTS[g_la[g_cap]];
+            clearKeysOf(a.id);
+            setKM()[vk] = a.id;
+            std::wstring s = std::wstring(L"\"") + a.label + L"\" = " + nameOf(vk);
             SetWindowTextW(g_status, s.c_str());
             g_cap = -1; refreshList(); saveSettings();
             return 0;
@@ -1389,7 +1777,12 @@ static LRESULT CALLBACK SetProc(HWND hw, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hw, m, wp, lp);
 }
 static void openSettings() {
-    if (g_set) { ShowWindow(g_set, SW_SHOW); SetForegroundWindow(g_set); return; }
+    int mode = g_isVid ? 2 : 1;
+    if (g_set) {
+        if (g_setMode == mode) { ShowWindow(g_set, SW_SHOW); SetForegroundWindow(g_set); return; }
+        DestroyWindow(g_set);                                   // other mode: rebuild with that mode's settings
+    }
+    g_setMode = mode;
     static bool reg;
     if (!reg) {
         WNDCLASSW wc = {};
@@ -1400,10 +1793,11 @@ static void openSettings() {
         reg = true;
     }
     HDC dc = GetDC(0); g_dpi = GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(0, dc);
-    RECT rc = {0, 0, S(590), S(520)};
+    RECT rc = {0, 0, S(600), S(635)};
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
     int w = rc.right - rc.left, hgt = rc.bottom - rc.top;
-    g_set = CreateWindowExW(WS_EX_APPWINDOW, L"LiteViewSettings", L"LiteView Settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+    g_set = CreateWindowExW(WS_EX_APPWINDOW, L"LiteViewSettings", mode == 2 ? L"LiteView - Video settings" : L"LiteView - Photo settings",
+                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                             (GetSystemMetrics(SM_CXSCREEN) - w) / 2, (GetSystemMetrics(SM_CYSCREEN) - hgt) / 2, w, hgt, 0, 0, g_inst, 0);
     SetForegroundWindow(g_set);
 }
@@ -1434,6 +1828,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
 
     loadSettings();
     s_vol = std::clamp(o_vol, 0, 130);
+    s_subscale = o_subpct / 100.0;
     wchar_t full[MAX_PATH * 2];
     GetFullPathNameW(argv[1], MAX_PATH * 2, full, 0);
     files.push_back(full); idx = 0; g_full = full; g_scanPending = true;   // folder is listed after the first frame
@@ -1446,7 +1841,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     h = p_mpv_create();
     char vol[16], sub[16];
     snprintf(vol, 16, "%d", std::clamp(o_vol, 0, 130));
-    snprintf(sub, 16, "%d", std::max(10, o_subsize));
+    snprintf(sub, 16, "%.2f", s_subscale);
     wchar_t cd[MAX_PATH];
     SHGetFolderPathW(0, CSIDL_LOCAL_APPDATA, 0, 0, cd);
     PathAppendW(cd, L"LiteView"); CreateDirectoryW(cd, 0);
@@ -1455,25 +1850,29 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     const char* o[][2] = {
         {"config", "no"}, {"load-scripts", "no"}, {"ytdl", "no"}, {"terminal", "no"}, {"msg-level", "all=no"},
         // --- renderer / quality ---
-        {"vo", o_next ? "gpu-next,gpu" : "gpu"}, {"gpu-api", "d3d11"}, {"gpu-context", "d3d11"}, {"gpu-shader-cache-dir", cache.c_str()}, {"icc-cache-dir", cache.c_str()},                                  // libplacebo renderer, falls back to classic gpu
-        {"hwdec", o_hwdec ? "auto-safe" : "no"},
-        {"scale", o_ultra ? "ewa_lanczossharp" : (o_hq ? "spline36" : "bilinear")},       // upscaling
-        {"dscale", (o_ultra || o_hq) ? "mitchell" : "hermite"},               // downscaling
+        {"vo", o_next ? "gpu-next,gpu" : "gpu"}, {"gpu-api", "d3d11"}, {"gpu-context", "d3d11"},
+        {"gpu-shader-cache-dir", cache.c_str()}, {"icc-cache-dir", cache.c_str()},
+        {"scale", o_ultra ? "ewa_lanczossharp" : (o_hq ? "spline36" : "bilinear")},
+        {"dscale", (o_ultra || o_hq) ? "mitchell" : "hermite"},
         {"correct-downscaling", "yes"}, {"linear-downscaling", o_ultra ? "yes" : "no"}, {"sigmoid-upscaling", o_ultra ? "yes" : "no"},
         {"icc-profile-auto", o_icc ? "yes" : "no"},
         {"deband", "no"}, {"deband-iterations", "1"},
         {"interpolation", "no"}, {"tscale", "oversample"}, {"video-sync", "audio"},
+        // --- video decoding: GPU decoding chosen per system, safe software fallback ---
+        {"hwdec", o_hwdec ? "auto-safe" : "no"}, {"hwdec-codecs", "all"}, {"framedrop", "vo"}, {"hdr-compute-peak", "no"},
+        // --- audio ---
+        {"audio-channels", o_stereo ? "stereo" : "auto-safe"}, {"audio-normalize-downmix", "yes"},
         // --- window / ui ---
         {"osc", "no"}, {"osd-bar", "no"}, {"input-default-bindings", "no"}, {"input-builtin-bindings", "no"},
         {"border", "no"}, {"title", ""}, {"force-window", "yes"}, {"keep-open", "yes"}, {"idle", "no"},
-        {"autofit-larger", "85%x85%"}, {"geometry", "50%:50%"}, {"window-dragging", "yes"}, {"cursor-autohide", "1500"},
+        {"autofit-larger", "85%x85%"}, {"geometry", "50%:50%"}, {"window-dragging", "no"}, {"cursor-autohide", "1500"},
         {"image-display-duration", "inf"}, {"background-color", "#000000"},
         {"osd-font-size", "30"}, {"osd-border-size", "2"}, {"osd-margin-y", "40"},
         {"fullscreen", o_startfs ? "yes" : "no"}, {"ontop", o_ontop ? "yes" : "no"},
-        // --- audio / subtitles / memory ---
+        // --- audio files / subtitles / memory ---
         {"volume", vol}, {"volume-max", "130"}, {"audio-display", "embedded-first"}, {"save-position-on-quit", "no"},
-        {"sub-auto", "fuzzy"}, {"sub-font-size", sub}, {"sub-border-size", "2"},
-        {"demuxer-max-bytes", "32MiB"}, {"demuxer-max-back-bytes", "8MiB"}, {"taskbar-progress", "no"}};
+        {"sub-auto", "fuzzy"}, {"sub-font-size", "40"}, {"sub-border-size", "2"}, {"sub-scale", sub},
+        {"demuxer-max-bytes", "48MiB"}, {"demuxer-max-back-bytes", "8MiB"}, {"taskbar-progress", "no"}};
     for (auto& kv : o) p_mpv_set_option_string(h, kv[0], kv[1]);
     if (o_slang[0]) p_mpv_set_option_string(h, "slang", U8(o_slang).c_str());
     if (o_alang[0]) p_mpv_set_option_string(h, "alang", U8(o_alang).c_str());
@@ -1482,6 +1881,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     if (p_mpv_stream_cb_add_ro) p_mpv_stream_cb_add_ro(h, "lvmem", 0, sc_open);
     p_mpv_observe_property(h, 0, "pause", MPV_FORMAT_FLAG);
     p_mpv_observe_property(h, 0, "eof-reached", MPV_FORMAT_FLAG);
+    p_mpv_observe_property(h, 0, "fullscreen", MPV_FORMAT_FLAG);
     p_mpv_observe_property(h, 0, "duration", MPV_FORMAT_DOUBLE);
     p_mpv_observe_property(h, 0, "time-pos", MPV_FORMAT_DOUBLE);
     if (o_preload) {
@@ -1498,6 +1898,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
         DispatchMessageW(&msg);
     }
     if (g_hook) UnhookWindowsHookEx(g_hook);
+    saveResume();
     if (o_remvol) o_vol = (int)floor(s_vol + 0.5);
     saveSettings();
     p_mpv_terminate_destroy(h);
