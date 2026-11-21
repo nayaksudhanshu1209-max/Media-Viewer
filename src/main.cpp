@@ -64,7 +64,7 @@ static std::string KMS[2][256];      // [0] photo / [1] video : vk -> action
 // ---- user options (edited in the Settings window, stored in %APPDATA%\LiteView\keys.ini) ----
 static int o_autonext = 1, o_remvol = 1, o_vol = 100, o_startfs = 0, o_ontop = 0, o_uisec = 2, o_preload = 1;
 static int o_inv = 0, o_invv = 0, o_swipe = 300, o_hq = 1, o_smooth = 0, o_deband = 0, o_hwdec = 1;
-static int o_ultra = 0, o_icc = 0, o_next = 0, o_stereo = 1, o_resume = 1, o_subpct = 100;
+static int o_ultra = 0, o_icc = 0, o_next = 0, o_stereo = 1, o_resume = 1, o_subpct = 100, o_predec = 1, o_subpos = 100;
 static wchar_t o_slang[16], o_alang[16];
 
 static volatile LONG g_preIdx = -1;
@@ -76,6 +76,7 @@ static bool c_pause, c_eof, c_full;         // pushed by mpv (observed)
 static double s_vol = 100, s_bright, s_contrast, s_sat, s_zoom, s_px, s_py, s_speed = 1, s_subdelay, s_audiodelay, s_subscale = 1;
 static int s_rot;
 static bool s_mute, s_loop;
+static double s_brightF, s_subpos = 100;   // s_brightF keeps the fractional value so tiny touchpad steps add up
 static bool g_viewDirty, g_osdDirty, g_seekDirty;
 static double g_tView, g_tSeek, g_tOsd, g_tOv, g_seekTarget;
 static volatile LONG g_mmPending;           // coalesced mouse-move from the hook thread
@@ -141,6 +142,8 @@ static void menuCmd(int id);
 static void act(const std::string& a);
 static void openPanel(int p, int anchor);
 static void closePanel();
+static void toggleFullscreen();
+static void clearOverlays();
 
 // ======================= file types =======================
 static bool extIn(std::wstring e, const wchar_t* const* L_, int n) {
@@ -252,24 +255,29 @@ static void applyRuntime() {
 static void sendView() { setd("video-zoom", s_zoom); setd("video-pan-x", s_px); setd("video-pan-y", s_py); }
 static void viewChanged() { g_viewDirty = true; kick(); }
 static void setVol(double v) { s_vol = std::clamp(v, 0.0, 130.0); setd("volume", s_vol); }
-static void setBright(double v) { s_bright = std::clamp(floor(v + 0.5), -100.0, 100.0); setd("brightness", s_bright); }
+static void setBright(double v) {
+    s_brightF = std::clamp(v, -100.0, 100.0);          // fractional accumulator (smooth gestures)
+    double r = floor(s_brightF + 0.5);
+    if (r != s_bright) { s_bright = r; setd("brightness", s_bright); }
+}
 static void setContrast(double v) { s_contrast = std::clamp(floor(v + 0.5), -100.0, 100.0); setd("contrast", s_contrast); }
 static void setSat(double v) { s_sat = std::clamp(floor(v + 0.5), -100.0, 100.0); setd("saturation", s_sat); }
 static void setSpeed(double v) { s_speed = std::clamp(floor(v * 20 + 0.5) / 20, 0.1, 8.0); setd("speed", s_speed); }
 static void setSubScale(double v) { s_subscale = std::clamp(floor(v * 20 + 0.5) / 20, 0.3, 3.0); setd("sub-scale", s_subscale); }
+static void setSubPos(double v) { s_subpos = std::clamp(floor(v + 0.5), 30.0, 100.0); o_subpos = (int)s_subpos; setd("sub-pos", s_subpos); }
 static void setSubDelay(double v) { s_subdelay = floor(v * 10 + 0.5) / 10; setd("sub-delay", s_subdelay); }
 static void setAudDelay(double v) { s_audiodelay = floor(v * 10 + 0.5) / 10; setd("audio-delay", s_audiodelay); }
 
 // ======================= Windows codec route (HEIC, RAW, JPEG XR, fallback) =======================
 // Decoded on a low-priority worker thread to a 24-bit BMP held in memory, then served to mpv via a custom "lvmem://" stream.
 struct Blob { std::vector<unsigned char> d; };
-static CRITICAL_SECTION g_bl;
+static CRITICAL_SECTION g_bl, g_cc;
 static std::vector<std::pair<int, std::shared_ptr<Blob>>> g_blobList;
 static int g_blobSeq;
 static int addBlob(std::shared_ptr<Blob> b) {
     EnterCriticalSection(&g_bl);
     int id = ++g_blobSeq;
-    g_blobList.clear();                               // only the newest picture is kept
+    g_blobList.clear();                               // only the newest picture is kept here
     g_blobList.push_back({id, b});
     LeaveCriticalSection(&g_bl);
     return id;
@@ -304,19 +312,19 @@ static int sc_open(void*, char* uri, mpv_stream_cb_info* info) {
     info->read_fn = sc_read; info->seek_fn = sc_seek; info->size_fn = sc_size; info->close_fn = sc_close; info->cancel_fn = 0;
     return 0;
 }
-static std::shared_ptr<Blob> wicDecode(const std::wstring& path) {
-    IWICImagingFactory* fac = 0; IWICBitmapDecoder* dec = 0; IWICBitmapFrameDecode* fr = 0;
+struct WicJob { std::wstring path; int token, idx; bool fb; };
+struct WicRes { std::shared_ptr<Blob> blob; int token, idx; bool fb; bool preview; };
+
+// any WIC bitmap source -> bottom-up 24-bit BMP in memory
+static std::shared_ptr<Blob> makeBmp(IWICImagingFactory* fac, IWICBitmapSource* src, unsigned long long maxPix) {
     IWICFormatConverter* cv = 0; IWICBitmapFlipRotator* fl = 0;
     std::shared_ptr<Blob> out;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, 0, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory, (void**)&fac))) return out;
+    UINT w = 0, h = 0;
+    src->GetSize(&w, &h);
     do {
-        if (FAILED(fac->CreateDecoderFromFilename(path.c_str(), 0, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) break;
-        if (FAILED(dec->GetFrame(0, &fr))) break;
-        UINT w = 0, h = 0;
-        fr->GetSize(&w, &h);
-        if (!w || !h || (unsigned long long)w * h > 100000000ULL) break;          // up to 100 megapixels
+        if (!w || !h || (unsigned long long)w * h > maxPix) break;
         if (FAILED(fac->CreateFormatConverter(&cv))) break;
-        if (FAILED(cv->Initialize(fr, GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, 0, 0, WICBitmapPaletteTypeCustom))) break;
+        if (FAILED(cv->Initialize(src, GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, 0, 0, WICBitmapPaletteTypeCustom))) break;
         if (FAILED(fac->CreateBitmapFlipRotator(&fl))) break;                      // BMP rows are stored bottom-up
         if (FAILED(fl->Initialize(cv, WICBitmapTransformFlipVertical))) break;
         UINT stride = (w * 3 + 3) & ~3u;
@@ -333,22 +341,40 @@ static std::shared_ptr<Blob> wicDecode(const std::wstring& path) {
     } while (0);
     if (fl) fl->Release();
     if (cv) cv->Release();
+    return out;
+}
+// job != 0: also post the embedded thumbnail first, so something appears almost at once while the full image decodes
+static std::shared_ptr<Blob> wicDecode(const std::wstring& path, unsigned long long maxPix, const WicJob* job) {
+    IWICImagingFactory* fac = 0; IWICBitmapDecoder* dec = 0; IWICBitmapFrameDecode* fr = 0;
+    std::shared_ptr<Blob> out;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, 0, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory, (void**)&fac))) return out;
+    do {
+        if (FAILED(fac->CreateDecoderFromFilename(path.c_str(), 0, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) break;
+        if (job) {
+            IWICBitmapSource* th = 0;
+            if (SUCCEEDED(dec->GetThumbnail(&th)) && th) {
+                std::shared_ptr<Blob> pb = makeBmp(fac, th, 4000000ULL);
+                th->Release();
+                if (pb) PostMessageW(g_mw, WM_USER + 4, 0, (LPARAM) new WicRes{pb, job->token, job->idx, job->fb, true});
+            }
+        }
+        if (FAILED(dec->GetFrame(0, &fr))) break;
+        out = makeBmp(fac, fr, maxPix);
+    } while (0);
     if (fr) fr->Release();
     if (dec) dec->Release();
     fac->Release();
     return out;
 }
-struct WicJob { std::wstring path; int token, idx; bool fb; };
-struct WicRes { std::shared_ptr<Blob> blob; int token, idx; bool fb; };
 static volatile LONG g_wicToken;
 static int g_wicTried = -1;
 static DWORD WINAPI wicThread(LPVOID p) {
     WicJob* j = (WicJob*)p;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // keep the window responsive while decoding
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);   // the user is waiting for this one: full priority
     CoInitializeEx(0, COINIT_MULTITHREADED);
-    std::shared_ptr<Blob> b = wicDecode(j->path);
+    std::shared_ptr<Blob> b = wicDecode(j->path, 100000000ULL, j);
     CoUninitialize();
-    PostMessageW(g_mw, WM_USER + 2, 0, (LPARAM) new WicRes{b, j->token, j->idx, j->fb});
+    PostMessageW(g_mw, WM_USER + 2, 0, (LPARAM) new WicRes{b, j->token, j->idx, j->fb, false});
     delete j;
     return 0;
 }
@@ -361,6 +387,61 @@ static void startWic(int i, bool fallback) {
 }
 static void showCantOpen() {
     cmd("show-text", "Can't open this file (missing codec?)\nHEIC / RAW: install the free HEIF, HEVC and RAW image extensions from the Microsoft Store", "6000");
+}
+
+// ---- background pre-decode of the next / previous HEIC & RAW photo (they are the slow ones) ----
+struct CEnt { std::wstring path; std::shared_ptr<Blob> blob; };
+static std::vector<CEnt> g_cache;
+static std::vector<std::wstring> g_want;
+static HANDLE g_ccEv;
+static bool cacheGet(const std::wstring& p, std::shared_ptr<Blob>& out) {
+    bool ok = false;
+    EnterCriticalSection(&g_cc);
+    for (auto& e : g_cache) if (e.path == p && e.blob) { out = e.blob; ok = true; }
+    LeaveCriticalSection(&g_cc);
+    return ok;
+}
+static void cachePlan(const std::vector<std::wstring>& want) {
+    EnterCriticalSection(&g_cc);
+    g_want = want;
+    for (size_t i = g_cache.size(); i-- > 0;)             // forget (and free) pictures that are no longer neighbours
+        if (std::find(want.begin(), want.end(), g_cache[i].path) == want.end()) g_cache.erase(g_cache.begin() + i);
+    LeaveCriticalSection(&g_cc);
+    SetEvent(g_ccEv);
+}
+static DWORD WINAPI ccWorker(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    CoInitializeEx(0, COINIT_MULTITHREADED);
+    for (;;) {
+        WaitForSingleObject(g_ccEv, INFINITE);
+        for (;;) {
+            std::wstring p;
+            EnterCriticalSection(&g_cc);
+            for (auto& w : g_want) {
+                bool have = false;
+                for (auto& e : g_cache) if (e.path == w) have = true;
+                if (!have) { p = w; break; }
+            }
+            LeaveCriticalSection(&g_cc);
+            if (p.empty()) break;
+            std::shared_ptr<Blob> b = wicDecode(p, 24000000ULL, 0);          // photos above 24 MP are not cached
+            EnterCriticalSection(&g_cc);
+            if (std::find(g_want.begin(), g_want.end(), p) != g_want.end()) g_cache.push_back({p, b});   // b may be null = "failed, don't retry"
+            LeaveCriticalSection(&g_cc);
+        }
+    }
+    return 0;
+}
+static void planCache() {
+    std::vector<std::wstring> want;
+    int n = (int)files.size();
+    if (o_predec && !g_isVid && n > 1)
+        for (int d = 1; d >= -1; d -= 2) {
+            int i = ((idx + d) % n + n) % n;
+            if (i == idx || !isWicPrimary(std::wstring(PathFindExtensionW(files[i].c_str())))) continue;
+            if (std::find(want.begin(), want.end(), files[i]) == want.end()) want.push_back(files[i]);
+        }
+    if (g_ccEv) cachePlan(want);
 }
 
 // ======================= resume position (per video) =======================
@@ -398,11 +479,14 @@ static void saveResume() {
 }
 
 // ======================= loading =======================
+static bool g_loading;
 static void doLoad() {
     int i = g_pending; g_pending = -1;
     if (i < 0 || i >= (int)files.size()) return;
     g_lastLoad = GetTickCount();
+    g_loading = true;
     InterlockedIncrement(&g_wicToken);              // drop any decode still running for a previous file
+    bool wasVid = g_isVid;
     saveResume();                                    // remember where the previous video stopped
     g_curVid.clear(); c_pos = 0; c_dur = 0; g_toastUntil = 0;
     closePanel();
@@ -416,7 +500,20 @@ static void doLoad() {
     if (s_rot) { s_rot = 0; setd("video-rotate", 0); }
     bool lp = (e == L".gif" || e == L".webp" || e == L".apng");
     if (lp != s_loop) { s_loop = lp; setp("loop-file", lp ? "inf" : "no"); }
-    if (isWicPrimary(e)) { startWic(i, false); return; }   // HEIC / RAW / JXR: decode with Windows codecs (old picture stays until ready)
+    if (isWicPrimary(e)) {                           // HEIC / RAW / JXR: Windows codecs
+        std::shared_ptr<Blob> cb;
+        if (cacheGet(p, cb)) {                       // already decoded in the background: show it at once
+            g_wicTried = i;
+            int id = addBlob(cb);
+            char u[48]; snprintf(u, 48, "lvmem://%d.bmp", id);
+            cmd("loadfile", u, "replace");
+            setp("pause", "no");
+            return;
+        }
+        if (wasVid) setp("pause", "yes");            // stop the old video eating the CPU while the photo decodes
+        startWic(i, false);                          // thumbnail first, full picture when ready
+        return;
+    }
     std::string u = U8(p);
     char st[48] = "";
     double rp = 0, rd = 0;
@@ -436,7 +533,7 @@ static void openIdx(int i) {
     idx = i;
     g_pending = i;
     showUI();
-    if (GetTickCount() - g_lastLoad >= 90) doLoad();     // first request loads at once; a burst only loads the latest
+    if (!g_loading || GetTickCount() - g_lastLoad >= 90) doLoad();     // idle: load at once; during a burst only the latest target loads
     else kick();
 }
 static void go(int d) {
@@ -521,6 +618,7 @@ static const Act ACTS[] = {
     {"subcycle", L"Next subtitle track", 2}, {"audiocycle", L"Next audio track", 2},
     {"subdelayminus", L"Subtitle delay -0.1 s", 2}, {"subdelayplus", L"Subtitle delay +0.1 s", 2},
     {"audiodelayminus", L"Audio delay -0.1 s", 2}, {"audiodelayplus", L"Audio delay +0.1 s", 2},
+    {"subposup", L"Move subtitles up", 2}, {"subposdown", L"Move subtitles down", 2},
     {"loop", L"Loop video", 2}, {"screenshot", L"Screenshot", 2}};
 static const int NACT = sizeof(ACTS) / sizeof(*ACTS);
 
@@ -559,7 +657,7 @@ static const DefKey DEFK_V[] = {                       // video player: arrows s
     {L"PgUp", "prev"}, {L"Home", "first"}, {L"End", "last"}, {L"Space", "pause"}, {L"K", "pause"}, {L"M", "mute"}, {L"F", "fullscreen"},
     {L"Enter", "fullscreen"}, {L"J", "seekback10"}, {L"L", "seekfwd10"}, {L"Period", "framenext"}, {L"Comma", "frameback"},
     {L"RBracket", "speedup"}, {L"LBracket", "speeddown"}, {L"Backspace", "speedreset"}, {L"C", "subcycle"}, {L"A", "audiocycle"},
-    {L"Z", "subdelayminus"}, {L"X", "subdelayplus"}, {L"O", "loop"}, {L"P", "screenshot"}, {L"R", "rotate"}, {L"B", "brightup"},
+    {L"Z", "subdelayminus"}, {L"X", "subdelayplus"}, {L"W", "subposup"}, {L"E", "subposdown"}, {L"O", "loop"}, {L"P", "screenshot"}, {L"R", "rotate"}, {L"B", "brightup"},
     {L"V", "brightdown"}, {L"Plus", "zoomin"}, {L"Minus", "zoomout"}, {L"0", "zoomreset"}, {L"I", "info"}, {L"Delete", "delete"},
     {L"S", "settings"}, {L"F1", "settings"}, {L"Tab", "menu"}};
 
@@ -591,6 +689,7 @@ static void loadSettings() {
     o_ultra = gi(L"ultra_quality", 0); o_icc = gi(L"icc_profile", 0); o_next = gi(L"gpu_next", 0);
     o_hwdec = gi(L"hardware_decoding", 1); o_stereo = gi(L"stereo_downmix", 1); o_resume = gi(L"remember_position", 1);
     o_subpct = std::clamp(gi(L"subtitle_size_percent", 100), 30, 300);
+    o_predec = gi(L"predecode", 1); o_subpos = std::clamp(gi(L"subtitle_position", 100), 30, 100);
     gs(L"subtitle_language", o_slang); gs(L"audio_language", o_alang);
     static const wchar_t* sec[2] = {L"keys_photo", L"keys_video"};
     static wchar_t buf[8192];
@@ -616,7 +715,7 @@ static void saveSettings() {
     wi(L"reverse_scroll", o_invv); wi(L"swipe_distance", o_swipe); wi(L"high_quality", o_hq); wi(L"smooth_motion", o_smooth);
     wi(L"deband_video", o_deband); wi(L"ultra_quality", o_ultra); wi(L"icc_profile", o_icc); wi(L"gpu_next", o_next);
     wi(L"hardware_decoding", o_hwdec); wi(L"stereo_downmix", o_stereo); wi(L"remember_position", o_resume);
-    wi(L"subtitle_size_percent", o_subpct);
+    wi(L"subtitle_size_percent", o_subpct); wi(L"predecode", o_predec); wi(L"subtitle_position", o_subpos);
     WritePrivateProfileStringW(L"options", L"subtitle_language", o_slang, g_ini);
     WritePrivateProfileStringW(L"options", L"audio_language", o_alang, g_ini);
     static const wchar_t* sec[2] = {L"keys_photo", L"keys_video"};
@@ -634,7 +733,7 @@ static void saveSettings() {
 enum { B_PREV = 1, B_BACK, B_PLAY, B_FWD, B_NEXT, B_VOL, B_BRI, B_SPEED, B_SUB, B_AUD, B_MORE, B_ZOUT, B_ZIN, B_ZPILL, B_ROT, B_TSTART, B_TOK };
 enum { P_NONE = 0, P_VOL, P_BRI, P_SPEED, P_SUB, P_AUD };
 enum { H_BTN = 1, H_SEEK, H_SLIDER, H_ROW, H_PANEL, H_RESET };
-enum { S_VOL = 1, S_BRI, S_CON, S_SAT, S_SPEED, S_SUBSIZE, S_SUBDELAY, S_AUDDELAY };
+enum { S_VOL = 1, S_BRI, S_CON, S_SAT, S_SPEED, S_SUBSIZE, S_SUBDELAY, S_AUDDELAY, S_SUBPOS };
 enum { A_MUTE = 1, A_RESETCOL, A_RESETSPEED, A_SUBCYCLE, A_SUBLOAD, A_SUBOFF, A_AUDCYCLE, A_STEREO };
 struct Hit { int kind, id, x, y, w, h, tx, tw; };
 static Hit g_hits[96];
@@ -667,7 +766,7 @@ static int panelRows(int p, Row* r) {
                 sl(S_SAT, "Saturation", -100, 100, s_sat, 0, 0); ac(A_RESETCOL, "Reset colours"); break;
     case P_SPEED: sl(S_SPEED, "Speed", 0.25, 4, s_speed, 1, 1); ac(A_RESETSPEED, "Reset to 1x"); break;
     case P_SUB: snprintf(b, sizeof b, "Subtitles: %s   (tap to switch)", g_subTxt.c_str()); ac(A_SUBCYCLE, b);
-                sl(S_SUBSIZE, "Size", 30, 300, s_subscale * 100, 100, 3); sl(S_SUBDELAY, "Delay", -10, 10, s_subdelay, 0, 2);
+                sl(S_SUBSIZE, "Size", 30, 300, s_subscale * 100, 100, 3); sl(S_SUBDELAY, "Delay", -10, 10, s_subdelay, 0, 2); sl(S_SUBPOS, "Position", 30, 100, s_subpos, 100, 3);
                 ac(A_SUBLOAD, "Load subtitle file..."); ac(A_SUBOFF, "Turn subtitles off"); break;
     case P_AUD: snprintf(b, sizeof b, "Audio: %s   (tap to switch)", g_audTxt.c_str()); ac(A_AUDCYCLE, b);
                 sl(S_AUDDELAY, "Audio delay", -5, 5, s_audiodelay, 0, 2);
@@ -693,6 +792,7 @@ static void setSliderId(int id, double v) {
     case S_SUBSIZE: setSubScale(v / 100.0); o_subpct = (int)floor(s_subscale * 100 + 0.5); break;
     case S_SUBDELAY: setSubDelay(v); break;
     case S_AUDDELAY: setAudDelay(v); break;
+    case S_SUBPOS: setSubPos(v); break;
     }
 }
 static void openPanel(int p, int anchor) {
@@ -852,7 +952,7 @@ static void act(const std::string& a) {
     else if (a == "volup") { setVol(s_vol + 5); osdf("Volume %d%%", (int)floor(s_vol + 0.5)); }
     else if (a == "voldown") { setVol(s_vol - 5); osdf("Volume %d%%", (int)floor(s_vol + 0.5)); }
     else if (a == "mute") { s_mute = !s_mute; setp("mute", s_mute ? "yes" : "no"); osd(s_mute ? "Muted" : "Sound on"); }
-    else if (a == "fullscreen") cmd("cycle", "fullscreen");
+    else if (a == "fullscreen") toggleFullscreen();
     else if (a == "seekfwd") cmd("seek", "5");
     else if (a == "seekback") cmd("seek", "-5");
     else if (a == "seekfwd10") cmd("seek", "10");
@@ -874,6 +974,8 @@ static void act(const std::string& a) {
     else if (a == "subdelayplus") { setSubDelay(s_subdelay + 0.1); osdf("Subtitle delay %+.1f s", s_subdelay); }
     else if (a == "audiodelayminus") { setAudDelay(s_audiodelay - 0.1); osdf("Audio delay %+.1f s", s_audiodelay); }
     else if (a == "audiodelayplus") { setAudDelay(s_audiodelay + 0.1); osdf("Audio delay %+.1f s", s_audiodelay); }
+    else if (a == "subposup") { setSubPos(s_subpos - 3); osdf("Subtitle position %d%%", (int)s_subpos); }
+    else if (a == "subposdown") { setSubPos(s_subpos + 3); osdf("Subtitle position %d%%", (int)s_subpos); }
     else if (a == "loop") { s_loop = !s_loop; setp("loop-file", s_loop ? "inf" : "no"); osd(s_loop ? "Loop: on" : "Loop: off"); }
     else if (a == "info") showInfo();
     else if (a == "screenshot") {
@@ -945,64 +1047,147 @@ static void menuCmd(int id) {
 }
 
 // ======================= modern player UI (vector shapes in an ASS overlay) =======================
+// All geometry is emitted at 8x precision (\p4) so small curves stay smooth; icons are stroked/filled with rounded joins.
 static std::string A, A2, *g_cur = &A;
 static bool g_emit;
+static std::string g_last1, g_last2;                 // last overlay text sent (skip identical updates)
+static bool g_ovHold;                                // overlay hidden while the window changes size (fullscreen)
+static DWORD g_holdUntil;
+static int g_osdW, g_osdH;
 static void ap(const char* f, ...) {
     if (!g_emit) return;
     char b[3500];
     va_list v; va_start(v, f); vsnprintf(b, sizeof b, f, v); va_end(v);
     *g_cur += b;
 }
-static void shape(int x, int y, const std::string& path, const char* col, const char* al, const char* extra = "") {
-    ap("{\\an7\\pos(%d,%d)\\bord0\\shad0\\blur0.6\\1c&H%s&\\1a&H%s&%s\\p1}%s{\\p0}\n", x, y, col, al, extra, path.c_str());
+struct Pt { double x, y; };
+static std::string P8(const std::vector<Pt>& p) {
+    std::string s; char b[48];
+    for (size_t i = 0; i < p.size(); i++) { snprintf(b, sizeof b, "%s %ld %ld ", i ? "l" : "m", lround(p[i].x * 8), lround(p[i].y * 8)); s += b; }
+    return s;
 }
-static std::string rrPath(int w, int h, int r) {
-    r = std::max(1, std::min(r, std::min(w, h) / 2));
+static void shape(int x, int y, const std::string& path8, const char* col, const char* al, const char* extra = "") {
+    ap("{\\an7\\pos(%d,%d)\\bord0\\shad0\\blur0.5\\1c&H%s&\\1a&H%s&%s\\p4}%s{\\p0}\n", x, y, col, al, extra, path8.c_str());
+}
+static std::string rrPath(double w, double h, double r) {
+    r = std::max(0.5, std::min(r, std::min(w, h) / 2));
     double k = 0.5523 * r;
-    char b[640];
-    snprintf(b, sizeof b, "m %d 0 l %d 0 b %.1f 0 %d %.1f %d %d l %d %d b %d %.1f %.1f %d %d %d l %d %d b %.1f %d 0 %.1f 0 %d l 0 %d b 0 %.1f %.1f 0 %d 0",
-             r, w - r, w - r + k, w, r - k, w, r, w, h - r, w, h - r + k, w - r + k, h, w - r, h, r, h, r - k, h, h - r + k, h - r, r, r - k, r - k, r);
+    auto f = [](double v) { return (long)lround(v * 8); };
+    char b[800];
+    snprintf(b, sizeof b, "m %ld 0 l %ld 0 b %ld 0 %ld %ld %ld %ld l %ld %ld b %ld %ld %ld %ld %ld %ld l %ld %ld b %ld %ld 0 %ld 0 %ld l 0 %ld b 0 %ld %ld 0 %ld 0",
+             f(r), f(w - r), f(w - r + k), f(w), f(r - k), f(w), f(r), f(w), f(h - r), f(w), f(h - r + k), f(w - r + k), f(h), f(w - r), f(h),
+             f(r), f(h), f(r - k), f(h), f(h - r + k), f(h - r), f(r), f(r - k), f(r - k), f(r));
     return b;
 }
-static std::string circlePath(int d) { return rrPath(d, d, d / 2); }
-enum { I_PLAY = 1, I_PAUSE, I_PREV, I_NEXT, I_SPK, I_SUN, I_ROT };
-static std::string iconPath(int k, int s) {
-    char b[700];
+static std::string circlePath(double d) { return rrPath(d, d, d / 2); }
+// open polyline drawn as a stroke with round caps/joins (the path is retraced so it has no area; only the outline shows)
+static void strokeP(int x, int y, const std::vector<Pt>& pts, double thick, const char* col, const char* al) {
+    if (!g_emit || pts.size() < 2) return;
+    std::vector<Pt> q = pts;
+    for (int i = (int)pts.size() - 2; i >= 1; i--) q.push_back(pts[i]);
+    ap("{\\an7\\pos(%d,%d)\\shad0\\blur0.4\\1a&HFF&\\bord%.2f\\3c&H%s&\\3a&H%s&\\p4}%s{\\p0}\n", x, y, thick / 2, col, al, P8(q).c_str());
+}
+static void fillPolyP(int x, int y, const std::vector<Pt>& pts, double bord, const char* col, const char* al) {
+    if (!g_emit) return;
+    ap("{\\an7\\pos(%d,%d)\\shad0\\blur0.4\\1c&H%s&\\1a&H%s&\\bord%.2f\\3c&H%s&\\3a&H%s&\\p4}%s{\\p0}\n", x, y, col, al, bord, col, al, P8(pts).c_str());
+}
+// convex polygon with softly rounded corners (inset, then re-expanded by a round outline)
+static void fillRoundP(int x, int y, std::vector<Pt> pts, double r, const char* col, const char* al) {
+    if (!g_emit) return;
+    double cx = 0, cy = 0;
+    for (auto& p : pts) { cx += p.x; cy += p.y; }
+    cx /= pts.size(); cy /= pts.size();
+    double rin = 1e9;
+    for (size_t i = 0; i < pts.size(); i++) {
+        Pt a = pts[i], b = pts[(i + 1) % pts.size()];
+        double ex = b.x - a.x, ey = b.y - a.y, L = sqrt(ex * ex + ey * ey);
+        if (L < 1e-6) continue;
+        rin = std::min(rin, fabs((cx - a.x) * ey - (cy - a.y) * ex) / L);
+    }
+    double k = rin > r ? (rin - r) / rin : 0.5;
+    for (auto& p : pts) { p.x = cx + (p.x - cx) * k; p.y = cy + (p.y - cy) * k; }
+    fillPolyP(x, y, pts, r, col, al);
+}
+static void arcPts(std::vector<Pt>& v, double cx, double cy, double R, double a0, double a1, double st) {
+    for (double a = a0; a <= a1 + 1e-6; a += st) { double r = a * 3.14159265358979 / 180; v.push_back({cx + R * cos(r), cy + R * sin(r)}); }
+}
+enum { I_PLAY = 1, I_PAUSE, I_PREV, I_NEXT, I_SPK, I_SPKX, I_SUN, I_EQ, I_DOTS, I_CHL, I_CHR, I_MINUS, I_PLUS, I_ROT, I_SKB, I_SKF };
+static void drawIcon(int k, double cx, double cy, double s, const char* col, const char* al = "00") {
+    if (!g_emit) return;
+    const double PI = 3.14159265358979;
+    double ox = cx - s / 2, oy = cy - s / 2;
+    int px = (int)floor(ox), py = (int)floor(oy);
+    double dx = ox - px, dy = oy - py;
+    auto Q = [&](double u, double v) { return Pt{dx + u * s, dy + v * s}; };
+    auto arrow = [&](bool mir, double R) {
+        std::vector<Pt> v;
+        double ae = 0;
+        for (double a = -50; a <= 235; a += 8) {
+            double r = a * PI / 180, uu = 0.5 + R * cos(r), vv = 0.5 + R * sin(r);
+            if (mir) uu = 1 - uu;
+            v.push_back(Q(uu, vv)); ae = r;
+        }
+        strokeP(px, py, v, 0.085 * s, col, al);
+        double ex = 0.5 + R * cos(ae), ey = 0.5 + R * sin(ae), tx = -sin(ae), ty = cos(ae), nx = cos(ae), ny = sin(ae);
+        Pt tip{ex + tx * 0.2, ey + ty * 0.2}, b1{ex + nx * 0.13, ey + ny * 0.13}, b2{ex - nx * 0.13, ey - ny * 0.13};
+        if (mir) { tip.x = 1 - tip.x; b1.x = 1 - b1.x; b2.x = 1 - b2.x; }
+        fillRoundP(px, py, {Q(tip.x, tip.y), Q(b1.x, b1.y), Q(b2.x, b2.y)}, 0.03 * s, col, al);
+    };
     switch (k) {
-    case I_PLAY: snprintf(b, sizeof b, "m %d 0 l %d %d l %d %d", s * 15 / 100, s, s / 2, s * 15 / 100, s); return b;
-    case I_PAUSE: snprintf(b, sizeof b, "m %d 0 l %d 0 l %d %d l %d %d m %d 0 l %d 0 l %d %d l %d %d",
-                           s * 15 / 100, s * 40 / 100, s * 40 / 100, s, s * 15 / 100, s, s * 60 / 100, s * 85 / 100, s * 85 / 100, s, s * 60 / 100, s); return b;
-    case I_PREV: snprintf(b, sizeof b, "m %d 0 l %d 0 l %d %d l %d %d m %d %d l %d 0 l %d %d",
-                          s * 8 / 100, s * 22 / 100, s * 22 / 100, s, s * 8 / 100, s, s * 32 / 100, s / 2, s, s, s); return b;
-    case I_NEXT: snprintf(b, sizeof b, "m 0 0 l %d %d l 0 %d m %d 0 l %d 0 l %d %d l %d %d",
-                          s * 68 / 100, s / 2, s, s * 78 / 100, s * 92 / 100, s * 92 / 100, s, s * 78 / 100, s); return b;
-    case I_SPK: snprintf(b, sizeof b, "m 0 %d l %d %d l %d %d l %d %d l %d %d l 0 %d m %d %d l %d %d l %d %d l %d %d m %d %d l %d %d l %d %d l %d %d",
-                         s * 36 / 100, s * 22 / 100, s * 36 / 100, s * 50 / 100, s * 10 / 100, s * 50 / 100, s * 90 / 100, s * 22 / 100, s * 64 / 100, s * 64 / 100,
-                         s * 62 / 100, s * 38 / 100, s * 68 / 100, s * 38 / 100, s * 68 / 100, s * 62 / 100, s * 62 / 100, s * 62 / 100,
-                         s * 78 / 100, s * 24 / 100, s * 84 / 100, s * 24 / 100, s * 84 / 100, s * 76 / 100, s * 78 / 100, s * 76 / 100); return b;
+    case I_PLAY: fillRoundP(px, py, {Q(.27, .1), Q(.92, .5), Q(.27, .9)}, .07 * s, col, al); break;
+    case I_PAUSE:
+        shape((int)lround(ox + .17 * s), (int)lround(oy + .12 * s), rrPath(.24 * s, .76 * s, .08 * s), col, al);
+        shape((int)lround(ox + .59 * s), (int)lround(oy + .12 * s), rrPath(.24 * s, .76 * s, .08 * s), col, al);
+        break;
+    case I_PREV:
+        shape((int)lround(ox + .1 * s), (int)lround(oy + .14 * s), rrPath(.11 * s, .72 * s, .05 * s), col, al);
+        fillRoundP(px, py, {Q(.9, .14), Q(.3, .5), Q(.9, .86)}, .06 * s, col, al);
+        break;
+    case I_NEXT:
+        shape((int)lround(ox + .79 * s), (int)lround(oy + .14 * s), rrPath(.11 * s, .72 * s, .05 * s), col, al);
+        fillRoundP(px, py, {Q(.1, .14), Q(.7, .5), Q(.1, .86)}, .06 * s, col, al);
+        break;
+    case I_SPK: case I_SPKX: {
+        fillPolyP(px, py, {Q(.06, .38), Q(.26, .38), Q(.5, .16), Q(.5, .84), Q(.26, .62), Q(.06, .62)}, .025 * s, col, al);
+        if (k == I_SPK) {
+            for (int w = 0; w < 2; w++) { std::vector<Pt> v; arcPts(v, dx + .46 * s, dy + .5 * s, (.2 + .16 * w) * s, -42, 42, 6); strokeP(px, py, v, .075 * s, col, al); }
+        } else {
+            strokeP(px, py, {Q(.64, .36), Q(.94, .64)}, .075 * s, col, al);
+            strokeP(px, py, {Q(.94, .36), Q(.64, .64)}, .075 * s, col, al);
+        }
+        break;
+    }
     case I_SUN: {
-        std::string p;
-        for (int i = 0; i < 16; i++) {                                           // disc
-            double a = i * 3.14159265 / 8;
-            snprintf(b, sizeof b, "%s %d %d ", i ? "l" : "m", (int)(s * 0.5 + s * 0.2 * cos(a)), (int)(s * 0.5 + s * 0.2 * sin(a)));
-            p += b;
+        std::vector<Pt> v; arcPts(v, dx + .5 * s, dy + .5 * s, .2 * s, 0, 360, 15);
+        strokeP(px, py, v, .08 * s, col, al);
+        for (int i = 0; i < 8; i++) {
+            double a = i * PI / 4, c = cos(a), sn = sin(a);
+            strokeP(px, py, {Q(.5 + c * .34, .5 + sn * .34), Q(.5 + c * .46, .5 + sn * .46)}, .075 * s, col, al);
         }
-        for (int i = 0; i < 8; i++) {                                            // rays
-            double a = i * 3.14159265 / 4, c = cos(a), sn = sin(a), r1 = s * 0.31, r2 = s * 0.47, hw = s * 0.045;
-            double cx = s * 0.5, cy = s * 0.5;
-            snprintf(b, sizeof b, "m %d %d l %d %d l %d %d l %d %d ",
-                     (int)(cx + c * r1 - sn * hw), (int)(cy + sn * r1 + c * hw), (int)(cx + c * r2 - sn * hw), (int)(cy + sn * r2 + c * hw),
-                     (int)(cx + c * r2 + sn * hw), (int)(cy + sn * r2 - c * hw), (int)(cx + c * r1 + sn * hw), (int)(cy + sn * r1 - c * hw));
-            p += b;
-        }
-        return p;
+        break;
     }
+    case I_EQ: {
+        static const double xs[4] = {.2, .4, .6, .8}, hs[4] = {.12, .3, .2, .34};
+        for (int i = 0; i < 4; i++) strokeP(px, py, {Q(xs[i], .5 - hs[i]), Q(xs[i], .5 + hs[i])}, .1 * s, col, al);
+        break;
     }
-    return "";
+    case I_DOTS:
+        for (int i = 0; i < 3; i++) shape((int)lround(ox + (.2 + .3 * i) * s - .075 * s), (int)lround(oy + .5 * s - .075 * s), circlePath(.15 * s), col, al);
+        break;
+    case I_CHL: strokeP(px, py, {Q(.64, .14), Q(.3, .5), Q(.64, .86)}, .1 * s, col, al); break;
+    case I_CHR: strokeP(px, py, {Q(.36, .14), Q(.7, .5), Q(.36, .86)}, .1 * s, col, al); break;
+    case I_MINUS: strokeP(px, py, {Q(.18, .5), Q(.82, .5)}, .09 * s, col, al); break;
+    case I_PLUS:
+        strokeP(px, py, {Q(.18, .5), Q(.82, .5)}, .09 * s, col, al);
+        strokeP(px, py, {Q(.5, .18), Q(.5, .82)}, .09 * s, col, al);
+        break;
+    case I_ROT: arrow(false, .32); break;
+    case I_SKB: arrow(true, .36); break;
+    case I_SKF: arrow(false, .36); break;
+    }
 }
 static int txtw(const std::string& t, int fs) { return (int)(t.size() * fs * 0.56); }
-
-static const char* const ACC = "A6B814";         // accent (BGR)  teal
+static const char* const ACC = "A6B814";         // accent (BGR) teal
 static Hit* hitAt(int x, int y) {
     for (int i = g_nh - 1; i >= 0; i--) {
         Hit& k = g_hits[i];
@@ -1023,99 +1208,114 @@ static void fmtTime(double s, char* o) {
 // Builds hit regions and (if emit) the ASS text for the main overlay (A) and the resume popup (A2).
 static void uiBuild(int W, int H, bool emit) {
     g_nh = 0; g_emit = emit; A.clear(); A2.clear(); g_cur = &A;
-    const double u = std::clamp(H / 720.0, 0.8, 2.4);
+    const double u = std::clamp(H / 800.0, 0.85, 1.5);          // compact: grows slowly with the window
 #define U(v) ((int)((v) * u + 0.5))
-    auto addHit = [&](int kind, int id, int x, int y, int w, int h, int tx = 0, int tw = 0) { if (g_nh < 96) g_hits[g_nh++] = {kind, id, x, y, w, h, tx, tw}; };
-    auto pill = [&](int x, int y, int w, int hh, const char* col, const char* al) { if (g_emit) shape(x, y, rrPath(w, hh, hh / 2), col, al); };
-    auto label = [&](int x, int y, int an, int f, const char* col, const char* t, bool bold) {
-        ap("{\\an%d\\pos(%d,%d)\\fs%d\\b%d\\bord0\\shad0\\1c&H%s&}%s\n", an, x, y, f, bold ? 1 : 0, col, t); };
-    auto icon = [&](int k, int cx, int cy, int s, const char* col, const char* al = "00") { if (g_emit) shape(cx - s / 2, cy - s / 2, iconPath(k, s), col, al); };
-    auto ring = [&](int cx, int cy, int d) { if (g_emit) shape(cx - d / 2, cy - d / 2, circlePath(d), "FFFFFF", "FF", "\\bord2\\3c&HFFFFFF&"); };
+#define UF(v) ((v) * u)
+    auto addHit = [&](int kind, int id, int x, int y, int w, int hh, int tx = 0, int tw = 0) { if (g_nh < 96) g_hits[g_nh++] = {kind, id, x, y, w, hh, tx, tw}; };
+    auto pill = [&](int x, int y, int w, int hh, const char* col, const char* al) { if (g_emit) shape(x, y, rrPath(w, hh, hh / 2.0), col, al); };
+    auto glass = [&](int x, int y, int w, int hh, double r) {
+        if (!g_emit) return;
+        shape(x, y, rrPath(w, hh, r), "1C1C1E", "38");                                                // translucent dark body
+        shape(x, y, rrPath(w, hh, r), "FFFFFF", "FF", "\\bord1\\3c&HFFFFFF&\\3a&HE2&");                // hairline edge
+    };
+    auto label = [&](int x, int y, int an, double f, const char* col, const char* t, bool bold) {
+        ap("{\\an%d\\pos(%d,%d)\\fnSegoe UI\\fs%.1f\\b%d\\bord0\\shad0\\1c&H%s&}%s\n", an, x, y, f, bold ? 1 : 0, col, t); };
+    auto active = [&](int x, int y, int w, int hh, bool on) { if (on && g_emit) shape(x, y, rrPath(w, hh, UF(9)), "FFFFFF", "D0"); };
 
     const bool vis = controlsVisible();
-    int barTop = H - U(24);
+    int barTop = H - U(18);
     int si = g_shown;
     if (vis && si >= 0 && si < (int)files.size()) {                      // file name chip (top-left)
         std::string nm = U8(PathFindFileNameW(files[si].c_str()));
         for (auto& c : nm) if (c == '{' || c == '}') c = '('; else if (c == '\\') c = '/';
-        if (nm.size() > 56) nm = nm.substr(0, 53) + "...";
+        if (nm.size() > 52) nm = nm.substr(0, 49) + "...";
         char cnt[32]; snprintf(cnt, 32, "%d / %d", si + 1, (int)files.size());
-        int f = U(14), w = txtw(nm, f) + txtw(cnt, f) + U(50), hh = U(34), x = U(20), y = U(18);
-        pill(x, y, w, hh, "141414", "40");
-        label(x + U(16), y + hh / 2, 4, f, "FFFFFF", nm.c_str(), false);
-        label(x + w - U(16), y + hh / 2, 6, f, "B8B8B8", cnt, false);
+        double f = UF(11.5);
+        int w = txtw(nm, (int)f) + txtw(cnt, (int)f) + U(40), hh = U(26), x = U(14), y = U(14);
+        pill(x, y, w, hh, "1C1C1E", "38");
+        label(x + U(12), y + hh / 2, 4, f, "FFFFFF", nm.c_str(), false);
+        label(x + w - U(12), y + hh / 2, 6, f, "B0B0B0", cnt, false);
     }
     if (vis && g_isVid) {                                                // ---------- video control bar ----------
-        int bw = std::min(W - U(32), U(880)), bh = U(112), bx = (W - bw) / 2, by = H - U(22) - bh;
+        int bw = std::min(W - U(24), U(560)), bh = U(74), bx = (W - bw) / 2, by = H - U(18) - bh;
         barTop = by;
-        if (g_emit) shape(bx, by, rrPath(bw, bh, U(26)), "141414", "38");
+        glass(bx, by, bw, bh, UF(22));
         addHit(H_PANEL, 0, bx, by, bw, bh);
         double dur = c_dur, pos = (g_dragKind == 1) ? g_scrub : c_pos;
         double fr = dur > 0 ? std::clamp(pos / dur, 0.0, 1.0) : 0;
-        int sy = by + U(28);
+        int sy = by + U(20);
         char t1[16], t2[16]; fmtTime(pos, t1); fmtTime(dur, t2);
-        label(bx + U(24), sy, 4, U(13), "E0E0E0", t1, false);
-        label(bx + bw - U(24), sy, 6, U(13), "E0E0E0", t2, false);
-        int tx0 = bx + U(86), tx1 = bx + bw - U(86), tw = tx1 - tx0, th = U(6);
-        pill(tx0, sy - th / 2, tw, th, "FFFFFF", "A8");
+        label(bx + U(16), sy, 4, UF(11), "D0D0D0", t1, false);
+        label(bx + bw - U(16), sy, 6, UF(11), "D0D0D0", t2, false);
+        int tx0 = bx + U(56), tx1 = bx + bw - U(56), tw = tx1 - tx0, th = U(4);
+        pill(tx0, sy - th / 2, tw, th, "FFFFFF", "9A");
         int fw = (int)(tw * fr);
-        if (fw > 0) pill(tx0, sy - th / 2, std::max(fw, th), th, ACC, "00");
-        int kd = (g_dragKind == 1) ? U(19) : U(15);
+        if (fw > 0) pill(tx0, sy - th / 2, std::max(fw, th), th, "FFFFFF", "00");
+        int kd = (g_dragKind == 1) ? U(14) : U(11);
         if (g_emit) shape(tx0 + fw - kd / 2, sy - kd / 2, circlePath(kd), "FFFFFF", "00");
-        addHit(H_SEEK, 0, tx0 - U(10), sy - U(16), tw + U(20), U(32), tx0, tw);
+        addHit(H_SEEK, 0, tx0 - U(8), sy - U(13), tw + U(16), U(26), tx0, tw);
 
-        int cy = by + bh - U(35);
-        int bP = U(40), bR = U(46), bPl = U(54), gap = U(10);
-        int total = bP * 2 + bR * 2 + bPl + gap * 4, x = W / 2 - total / 2;
-        addHit(H_BTN, B_PREV, x, cy - bP / 2, bP, bP); icon(I_PREV, x + bP / 2, cy, U(17), "FFFFFF"); x += bP + gap;
-        addHit(H_BTN, B_BACK, x, cy - bR / 2, bR, bR); ring(x + bR / 2, cy, U(34)); label(x + bR / 2, cy, 5, U(12), "FFFFFF", "-10", true); x += bR + gap;
-        addHit(H_BTN, B_PLAY, x, cy - bPl / 2, bPl, bPl);
-        if (g_emit) shape(x, cy - bPl / 2, circlePath(bPl), "FFFFFF", "00");
-        icon(c_pause ? I_PLAY : I_PAUSE, x + bPl / 2 + (c_pause ? U(2) : 0), cy, U(20), "141414"); x += bPl + gap;
-        addHit(H_BTN, B_FWD, x, cy - bR / 2, bR, bR); ring(x + bR / 2, cy, U(34)); label(x + bR / 2, cy, 5, U(12), "FFFFFF", "+10", true); x += bR + gap;
-        addHit(H_BTN, B_NEXT, x, cy - bP / 2, bP, bP); icon(I_NEXT, x + bP / 2, cy, U(17), "FFFFFF");
+        int cy = by + bh - U(27);
+        int bP = U(30), bS = U(34), bPl = U(38), gap = U(6);
+        int total = bP * 2 + bS * 2 + bPl + gap * 4, x = W / 2 - total / 2;
+        addHit(H_BTN, B_PREV, x, cy - bP / 2, bP, bP); drawIcon(I_PREV, x + bP / 2, cy, UF(14), "FFFFFF"); x += bP + gap;
+        addHit(H_BTN, B_BACK, x, cy - bS / 2, bS, bS); drawIcon(I_SKB, x + bS / 2, cy, UF(26), "FFFFFF");
+        label(x + bS / 2, cy + (int)UF(1), 5, UF(8.5), "FFFFFF", "10", true); x += bS + gap;
+        addHit(H_BTN, B_PLAY, x, cy - bPl / 2, bPl, bPl); drawIcon(c_pause ? I_PLAY : I_PAUSE, x + bPl / 2 + (c_pause ? UF(1) : 0), cy, UF(19), "FFFFFF"); x += bPl + gap;
+        addHit(H_BTN, B_FWD, x, cy - bS / 2, bS, bS); drawIcon(I_SKF, x + bS / 2, cy, UF(26), "FFFFFF");
+        label(x + bS / 2, cy + (int)UF(1), 5, UF(8.5), "FFFFFF", "10", true); x += bS + gap;
+        addHit(H_BTN, B_NEXT, x, cy - bP / 2, bP, bP); drawIcon(I_NEXT, x + bP / 2, cy, UF(14), "FFFFFF");
 
-        int lx = bx + U(22);                                             // left: volume + brightness
-        addHit(H_BTN, B_VOL, lx, cy - U(20), U(40), U(40)); icon(I_SPK, lx + U(20), cy, U(20), s_mute ? "808080" : "FFFFFF");
-        addHit(H_BTN, B_BRI, lx + U(46), cy - U(20), U(40), U(40)); icon(I_SUN, lx + U(66), cy, U(21), "FFFFFF");
+        int box = U(30), lx = bx + U(10);                                // left: volume + brightness
+        active(lx, cy - box / 2, box, box, g_panel == P_VOL);
+        addHit(H_BTN, B_VOL, lx, cy - box / 2, box, box); drawIcon(s_mute ? I_SPKX : I_SPK, lx + box / 2, cy, UF(17), "FFFFFF");
+        lx += box + U(2);
+        active(lx, cy - box / 2, box, box, g_panel == P_BRI);
+        addHit(H_BTN, B_BRI, lx, cy - box / 2, box, box); drawIcon(I_SUN, lx + box / 2, cy, UF(17), "FFFFFF");
 
-        int rx = bx + bw - U(22), ph = U(32);                            // right: speed / subtitles / audio / more
-        auto rp = [&](int id, const char* txt, int w, bool active) {
-            rx -= w;
-            addHit(H_BTN, id, rx, cy - ph / 2, w, ph);
-            pill(rx, cy - ph / 2, w, ph, "FFFFFF", active ? "98" : "D8");
-            label(rx + w / 2, cy, 5, U(13), "FFFFFF", txt, true);
-            rx -= U(8);
-        };
-        rp(B_MORE, "...", U(44), false);
-        rp(B_AUD, "Audio", U(64), g_panel == P_AUD);
-        rp(B_SUB, "CC", U(46), g_panel == P_SUB);
+        int rx = bx + bw - U(10);                                        // right: speed / subtitles / audio / more
+        auto rbox = [&](int id, int panel) -> int {
+            rx -= box; active(rx, cy - box / 2, box, box, panel && g_panel == panel);
+            addHit(H_BTN, id, rx, cy - box / 2, box, box);
+            int c = rx + box / 2; rx -= U(2); return c; };
+        int c1 = rbox(B_MORE, 0); drawIcon(I_DOTS, c1, cy, UF(16), "FFFFFF");
+        int c2 = rbox(B_AUD, P_AUD); drawIcon(I_EQ, c2, cy, UF(16), "FFFFFF");
+        int c3 = rbox(B_SUB, P_SUB);
+        if (g_emit) { int cw = U(19), ch = U(14); shape(c3 - cw / 2, cy - ch / 2, rrPath(cw, ch, UF(3.5)), "FFFFFF", "FF", "\\bord1.3\\3c&HFFFFFF&\\3a&H00&"); }
+        label(c3, cy, 5, UF(8), "FFFFFF", "CC", true);
         char sp[16]; snprintf(sp, 16, "%gx", s_speed);
-        rp(B_SPEED, sp, U(58), g_panel == P_SPEED);
+        int sw = U(42), sh = U(22);
+        rx -= sw;
+        pill(rx, cy - sh / 2, sw, sh, "FFFFFF", g_panel == P_SPEED ? "A0" : "E4");
+        addHit(H_BTN, B_SPEED, rx, cy - box / 2, sw, box);
+        label(rx + sw / 2, cy, 5, UF(11), "FFFFFF", sp, true);
     } else if (vis) {                                                    // ---------- photo bar ----------
         static const int ids[8] = {B_PREV, B_NEXT, B_ZOUT, B_ZPILL, B_ZIN, B_ROT, B_BRI, B_MORE};
-        int wd[8] = {U(44), U(44), U(40), U(74), U(40), U(72), U(44), U(44)}, gap = U(8), tot = U(36);
+        int wd[8] = {U(30), U(30), U(30), U(54), U(30), U(30), U(30), U(30)}, gap = U(4), tot = U(24);
         for (int i = 0; i < 8; i++) tot += wd[i] + (i ? gap : 0);
-        int bh = U(62), bx = (W - tot) / 2, by = H - U(22) - bh, cy = by + bh / 2, x = bx + U(18);
+        int bh = U(44), bx = (W - tot) / 2, by = H - U(18) - bh, cy = by + bh / 2, x = bx + U(12);
         barTop = by;
-        if (g_emit) shape(bx, by, rrPath(tot, bh, U(28)), "141414", "38");
+        glass(bx, by, tot, bh, UF(20));
         addHit(H_PANEL, 0, bx, by, tot, bh);
         for (int i = 0; i < 8; i++) {
-            int id = ids[i], w = wd[i], hh = U(36);
+            int id = ids[i], w = wd[i], hh = U(30), cx = x + w / 2;
+            if (id == B_BRI) active(x, cy - hh / 2, w, hh, g_panel == P_BRI);
             addHit(H_BTN, id, x, cy - hh / 2, w, hh);
-            if (id == B_PREV) icon(I_PREV, x + w / 2, cy, U(16), "FFFFFF");
-            else if (id == B_NEXT) icon(I_NEXT, x + w / 2, cy, U(16), "FFFFFF");
-            else if (id == B_BRI) icon(I_SUN, x + w / 2, cy, U(21), "FFFFFF");
-            else {
-                pill(x, cy - hh / 2, w, hh, "FFFFFF", (id == B_BRI && g_panel == P_BRI) ? "98" : "D8");
+            switch (id) {
+            case B_PREV: drawIcon(I_CHL, cx, cy, UF(15), "FFFFFF"); break;
+            case B_NEXT: drawIcon(I_CHR, cx, cy, UF(15), "FFFFFF"); break;
+            case B_ZOUT: drawIcon(I_MINUS, cx, cy, UF(15), "FFFFFF"); break;
+            case B_ZIN: drawIcon(I_PLUS, cx, cy, UF(15), "FFFFFF"); break;
+            case B_ROT: drawIcon(I_ROT, cx, cy, UF(17), "FFFFFF"); break;
+            case B_BRI: drawIcon(I_SUN, cx, cy, UF(17), "FFFFFF"); break;
+            case B_MORE: drawIcon(I_DOTS, cx, cy, UF(16), "FFFFFF"); break;
+            case B_ZPILL: {
                 char t[24];
-                if (id == B_ZOUT) snprintf(t, 24, "-");
-                else if (id == B_ZIN) snprintf(t, 24, "+");
-                else if (id == B_ROT) snprintf(t, 24, "Rotate");
-                else if (id == B_MORE) snprintf(t, 24, "...");
-                else if (s_zoom <= 0.001) snprintf(t, 24, "Fit");
-                else snprintf(t, 24, "%d%%", (int)(100 * pow(2.0, s_zoom)));
-                label(x + w / 2, cy, 5, (id == B_ZOUT || id == B_ZIN) ? U(18) : U(13), "FFFFFF", t, true);
+                if (s_zoom <= 0.001) snprintf(t, 24, "Fit"); else snprintf(t, 24, "%d%%", (int)(100 * pow(2.0, s_zoom)));
+                pill(x, cy - U(11), w, U(22), "FFFFFF", "E4");
+                label(cx, cy, 5, UF(11), "FFFFFF", t, true);
+                break;
+            }
             }
             x += w + gap;
         }
@@ -1123,53 +1323,54 @@ static void uiBuild(int W, int H, bool emit) {
     if (g_panel && vis) {                                                // ---------- slider panel ----------
         Row rows[8];
         int nr = panelRows(g_panel, rows);
-        int pw = U(340), ph = U(20);
-        for (int i = 0; i < nr; i++) ph += rows[i].type == 0 ? U(56) : U(46);
-        int px = std::clamp(g_panelAnchor - pw / 2, U(12), std::max(U(12), W - pw - U(12))), py = barTop - U(12) - ph, yy = py + U(12);
-        if (g_emit) shape(px, py, rrPath(pw, ph, U(22)), "141414", "30");
+        int pw = U(268), ph = U(18);
+        for (int i = 0; i < nr; i++) ph += rows[i].type == 0 ? U(44) : U(34);
+        int px = std::clamp(g_panelAnchor - pw / 2, U(10), std::max(U(10), W - pw - U(10))), py = barTop - U(8) - ph, yy = py + U(10);
+        glass(px, py, pw, ph, UF(16));
         addHit(H_PANEL, 1, px, py, pw, ph);
         for (int i = 0; i < nr; i++) {
             Row& r = rows[i];
             if (r.type == 0) {
                 char vb[32]; fmtVal(r.fmt, r.v, vb);
-                label(px + U(22), yy + U(14), 4, U(13), "D0D0D0", r.label, false);
-                label(px + pw - U(22), yy + U(14), 6, U(13), "FFFFFF", vb, true);
-                addHit(H_RESET, r.id, px + pw - U(120), yy, U(110), U(28));
-                int tx = px + U(22), tw = pw - U(44), ty = yy + U(40), th = U(6);
+                label(px + U(16), yy + U(11), 4, UF(11), "D0D0D0", r.label, false);
+                label(px + pw - U(16), yy + U(11), 6, UF(11), "FFFFFF", vb, true);
+                addHit(H_RESET, r.id, px + pw - U(100), yy, U(90), U(22));
+                int tx = px + U(16), tw = pw - U(32), ty = yy + U(30), th = U(4);
                 double f = std::clamp((r.v - r.mn) / (r.mx - r.mn), 0.0, 1.0);
-                int fw = (int)(tw * f), kd = (g_dragKind == 2 && g_dragId == r.id) ? U(20) : U(16);
-                pill(tx, ty - th / 2, tw, th, "FFFFFF", "A8");
-                if (fw > 0) pill(tx, ty - th / 2, std::max(fw, th), th, ACC, "00");
+                int fw = (int)(tw * f), kd = (g_dragKind == 2 && g_dragId == r.id) ? U(15) : U(12);
+                pill(tx, ty - th / 2, tw, th, "FFFFFF", "9A");
+                if (fw > 0) pill(tx, ty - th / 2, std::max(fw, th), th, "FFFFFF", "00");
                 if (g_emit) shape(tx + fw - kd / 2, ty - kd / 2, circlePath(kd), "FFFFFF", "00");
-                addHit(H_SLIDER, r.id, tx - U(8), ty - U(16), tw + U(16), U(32), tx, tw);
-                yy += U(56);
+                addHit(H_SLIDER, r.id, tx - U(8), ty - U(12), tw + U(16), U(24), tx, tw);
+                yy += U(44);
             } else {
-                pill(px + U(16), yy + U(4), pw - U(32), U(36), "FFFFFF", "D8");
-                label(px + pw / 2, yy + U(22), 5, U(13), "FFFFFF", r.label, true);
-                addHit(H_ROW, r.id, px + U(16), yy + U(4), pw - U(32), U(36));
-                yy += U(46);
+                pill(px + U(12), yy + U(3), pw - U(24), U(26), "FFFFFF", "E4");
+                label(px + pw / 2, yy + U(16), 5, UF(11), "FFFFFF", r.label, true);
+                addHit(H_ROW, r.id, px + U(12), yy + U(3), pw - U(24), U(26));
+                yy += U(34);
             }
         }
     }
     if (toastActive() && g_isVid) {                                      // ---------- resume popup (bottom centre) ----------
         g_cur = &A2;
-        int tw = U(390), th = U(46), tx = (W - tw) / 2, ty = barTop - U(14) - th;
-        if (!vis) ty = H - U(26) - th;
+        int tw = U(300), th = U(36), tx = (W - tw) / 2, ty = barTop - U(10) - th;
+        if (!vis) ty = H - U(20) - th;
         char t1[16], msg[64]; fmtTime(g_toastPos, t1);
         snprintf(msg, sizeof msg, "Resumed at %s", t1);
-        if (g_emit) shape(tx, ty, rrPath(tw, th, th / 2), "141414", "30");
-        label(tx + U(22), ty + th / 2, 4, U(14), "FFFFFF", msg, false);
-        int bh = U(30), by2 = ty + (th - bh) / 2, wOk = U(48), wSt = U(100), bx2 = tx + tw - U(10) - wOk;
-        pill(bx2, by2, wOk, bh, "FFFFFF", "D8");
-        label(bx2 + wOk / 2, by2 + bh / 2, 5, U(13), "FFFFFF", "OK", true);
+        glass(tx, ty, tw, th, th / 2.0);
+        label(tx + U(18), ty + th / 2, 4, UF(11.5), "FFFFFF", msg, false);
+        int bh = U(24), by2 = ty + (th - bh) / 2, wOk = U(38), wSt = U(78), bx2 = tx + tw - U(8) - wOk;
+        pill(bx2, by2, wOk, bh, "FFFFFF", "E4");
+        label(bx2 + wOk / 2, by2 + bh / 2, 5, UF(11), "FFFFFF", "OK", true);
         addHit(H_BTN, B_TOK, bx2, by2, wOk, bh);
-        bx2 -= U(8) + wSt;
+        bx2 -= U(6) + wSt;
         pill(bx2, by2, wSt, bh, ACC, "00");
-        label(bx2 + wSt / 2, by2 + bh / 2, 5, U(13), "141414", "Start over", true);
+        label(bx2 + wSt / 2, by2 + bh / 2, 5, UF(11), "1C1C1E", "Start over", true);
         addHit(H_BTN, B_TSTART, bx2, by2, wSt, bh);
         g_cur = &A;
     }
 #undef U
+#undef UF
 }
 
 static void clearOverlays() {
@@ -1180,10 +1381,13 @@ static void clearOverlays() {
 }
 static void overlay() {
     if (!g_vw) return;
-    static std::string last1, last2;
+    if (g_ovHold) {                                              // window is changing size: stay hidden, redraw when it settled
+        if (GetTickCount() < g_holdUntil) return;
+        g_ovHold = false; g_last1.clear(); g_last2.clear();
+    }
     bool vis = controlsVisible(), toast = toastActive();
     if (!vis && !toast) {
-        if (g_ov) { clearOverlays(); g_ov = false; last1.clear(); last2.clear(); }
+        if (g_ov) { clearOverlays(); g_ov = false; g_last1.clear(); g_last2.clear(); }
         return;
     }
     RECT r; GetClientRect(g_vw, &r);
@@ -1194,19 +1398,28 @@ static void overlay() {
     while (!A2.empty() && A2.back() == '\n') A2.pop_back();
     char ws[16], hs[16]; sprintf(ws, "%d", W); sprintf(hs, "%d", H);
     std::string k = std::string(ws) + "x" + hs;
-    if (A.empty()) { if (!last1.empty()) { const char* a[] = {"osd-overlay", "1", "none", "", 0}; p_mpv_command_async(h, 0, a); last1.clear(); } }
-    else if (A + k != last1) {
-        last1 = A + k;
+    if (A.empty()) { if (!g_last1.empty()) { const char* a[] = {"osd-overlay", "1", "none", "", 0}; p_mpv_command_async(h, 0, a); g_last1.clear(); } }
+    else if (A + k != g_last1) {
+        g_last1 = A + k;
         const char* a[] = {"osd-overlay", "1", "ass-events", A.c_str(), ws, hs, 0};
         p_mpv_command_async(h, 0, a);
     }
-    if (A2.empty()) { if (!last2.empty()) { const char* a[] = {"osd-overlay", "2", "none", "", 0}; p_mpv_command_async(h, 0, a); last2.clear(); } }
-    else if (A2 + k != last2) {
-        last2 = A2 + k;
+    if (A2.empty()) { if (!g_last2.empty()) { const char* a[] = {"osd-overlay", "2", "none", "", 0}; p_mpv_command_async(h, 0, a); g_last2.clear(); } }
+    else if (A2 + k != g_last2) {
+        g_last2 = A2 + k;
         const char* a[] = {"osd-overlay", "2", "ass-events", A2.c_str(), ws, hs, 0};
         p_mpv_command_async(h, 0, a);
     }
     g_ov = true;
+}
+// Fullscreen: remove the overlay BEFORE the window changes size (otherwise mpv stretches the old one for a few frames),
+// then redraw it as soon as mpv reports the new size.
+static void toggleFullscreen() {
+    g_ovHold = true;
+    g_holdUntil = GetTickCount() + 450;
+    clearOverlays();
+    g_ov = false; g_last1.clear(); g_last2.clear();
+    cmd("cycle", "fullscreen");
 }
 
 // ======================= input: gestures, buttons, sliders =======================
@@ -1291,7 +1504,8 @@ static void onWheel(UINT t, WPARAM wp, LPARAM lp) {
     int raw = GET_WHEEL_DELTA_WPARAM(wp);
     if (!raw || !g_vw) return;
     DWORD now = GetTickCount();
-    if (raw % 120) tpUntil = now + 600;          // fractional delta => precision touchpad
+    if (raw % 120) tpUntil = now + 1200;         // fractional delta => precision touchpad
+    else if (now < tpUntil) tpUntil = now + 1200; // keep that classification for the whole gesture (no direction flips mid-swipe)
     bool tp = now < tpUntil;
     double d = raw / 120.0;
     POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -1333,11 +1547,12 @@ static void onWheel(UINT t, WPARAM wp, LPARAM lp) {
         return;
     }
     if (shift && !tp) { snprintf(b, 96, "%d", (int)(d * 5)); cmd("seek", b); return; }
-    // video: right half = volume, left half = brightness (touchpad: swipe up = increase)
+    // video: right half = volume, left half = brightness. Every wheel notch = 5 points; touchpads add up
+    // fractionally (no rounding), so slow swipes move smoothly instead of getting stuck. Swipe up = increase.
     double dv = d;
     if (tp) { dv = -d; if (o_invv) dv = -dv; }
-    if (pt.x > W / 2) { setVol(s_vol + dv * (tp ? 3 : 5)); osdLater("Volume %d%%", (int)floor(s_vol + 0.5)); }
-    else { setBright(s_bright + dv * (tp ? 3 : 4)); osdLater("Brightness %d", (int)s_bright); }
+    if (pt.x > W / 2) { setVol(s_vol + dv * 5); osdLater("Volume %d%%", (int)floor(s_vol + 0.5)); }
+    else { setBright(s_brightF + dv * 5); osdLater("Brightness %d", (int)s_bright); }
     kick();
 }
 
@@ -1495,7 +1710,7 @@ static void wake(void*) { PostMessageW(g_mw, WM_USER + 1, 0, 0); }
 static void pump() {
     double t = nowms();
     DWORD now = GetTickCount();
-    if (g_pending >= 0 && now - g_lastLoad >= 90) doLoad();
+    if (g_pending >= 0 && (!g_loading || now - g_lastLoad >= 90)) doLoad();
     if (g_viewDirty && t - g_tView >= 10) { sendView(); g_viewDirty = false; g_tView = t; }
     if (g_seekDirty && t - g_tSeek >= 60) { char b[48]; snprintf(b, 48, "%.2f", g_seekTarget); cmd("seek", b, "absolute+keyframes"); g_seekDirty = false; g_tSeek = t; }
     if (g_osdDirty && t - g_tOsd >= 70) { osd(g_osdBuf); g_osdDirty = false; g_tOsd = t; }
@@ -1522,6 +1737,12 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
                     if (!strcmp(p->name, "pause")) c_pause = v != 0;
                     else if (!strcmp(p->name, "eof-reached")) c_eof = v != 0;
                     else if (!strcmp(p->name, "fullscreen")) c_full = v != 0;
+                } else if (p->format == MPV_FORMAT_INT64) {
+                    long long v = *(long long*)p->data;
+                    bool ch = false;
+                    if (!strcmp(p->name, "osd-width")) { if (v != g_osdW) { g_osdW = (int)v; ch = true; } }
+                    else if (!strcmp(p->name, "osd-height")) { if (v != g_osdH) { g_osdH = (int)v; ch = true; } }
+                    if (ch) { g_ovHold = false; g_last1.clear(); g_last2.clear(); g_tOv = 0; overlay(); }   // new size: redraw at once
                 } else if (p->format == MPV_FORMAT_NONE) {
                     if (!strcmp(p->name, "duration")) c_dur = 0; else if (!strcmp(p->name, "time-pos")) c_pos = 0;
                     else if (!strcmp(p->name, "eof-reached")) c_eof = false;
@@ -1544,6 +1765,8 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
                     if (st) CloseHandle(st); else delete sj;
                 }
                 g_shown = idx;
+                g_loading = false;
+                planCache();                              // start decoding the neighbouring HEIC/RAW photos
                 if (o_preload && g_preEv && g_preIdx != idx) { g_preIdx = idx; SetEvent(g_preEv); }
                 if (!g_fixed && e->event_id == MPV_EVENT_VIDEO_RECONFIG) {
                     g_fixed = true;                       // stop mpv resizing the window for every new file
@@ -1551,6 +1774,17 @@ static LRESULT CALLBACK MW(HWND w, UINT m, WPARAM wp, LPARAM lp) {
                 }
             }
         }
+        return 0;
+    }
+    if (m == WM_USER + 4) {                       // quick low-resolution preview while a HEIC/RAW decodes
+        WicRes* r = (WicRes*)lp;
+        if (r->token == g_wicToken && r->idx == idx && idx < (int)files.size() && r->blob) {
+            int id = addBlob(r->blob);
+            char u[48]; snprintf(u, 48, "lvmem://%d.bmp", id);
+            cmd("loadfile", u, "replace");
+            setp("pause", "no");
+        }
+        delete r;
         return 0;
     }
     if (m == WM_USER + 2) {                       // Windows-codec decode finished
@@ -1605,6 +1839,7 @@ static Opt OPTS[] = {
     {L"Ultra quality: heaviest scaler, needs a decent GPU", 0, &o_ultra, 1},
     {L"Colour-managed display (ICC profile, slower start)", 0, &o_icc, 1},
     {L"Touchpad swipe distance for next / previous (smaller = more sensitive)", 1, &o_swipe, 1},
+    {L"Pre-decode the next / previous HEIC and RAW photo (faster, uses more memory)", 0, &o_predec, 1},
     // ---- video player ----
     {L"Hardware (GPU) decoding - picks the best method for this PC", 0, &o_hwdec, 2},
     {L"Smooth motion (display-resample + interpolation, heavier)", 0, &o_smooth, 2},
@@ -1808,6 +2043,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     g_inst = hi;
     InitializeCriticalSection(&g_fl);
     InitializeCriticalSection(&g_bl);
+    InitializeCriticalSection(&g_cc);
     CoInitializeEx(0, COINIT_APARTMENTTHREADED);
     int argc;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -1842,6 +2078,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     char vol[16], sub[16];
     snprintf(vol, 16, "%d", std::clamp(o_vol, 0, 130));
     snprintf(sub, 16, "%.2f", s_subscale);
+    char subpos[16]; snprintf(subpos, 16, "%d", o_subpos); s_subpos = o_subpos;
     wchar_t cd[MAX_PATH];
     SHGetFolderPathW(0, CSIDL_LOCAL_APPDATA, 0, 0, cd);
     PathAppendW(cd, L"LiteView"); CreateDirectoryW(cd, 0);
@@ -1871,7 +2108,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
         {"fullscreen", o_startfs ? "yes" : "no"}, {"ontop", o_ontop ? "yes" : "no"},
         // --- audio files / subtitles / memory ---
         {"volume", vol}, {"volume-max", "130"}, {"audio-display", "embedded-first"}, {"save-position-on-quit", "no"},
-        {"sub-auto", "fuzzy"}, {"sub-font-size", "40"}, {"sub-border-size", "2"}, {"sub-scale", sub},
+        {"sub-auto", "fuzzy"}, {"sub-font-size", "40"}, {"sub-border-size", "2"}, {"sub-scale", sub}, {"sub-pos", subpos},
         {"demuxer-max-bytes", "48MiB"}, {"demuxer-max-back-bytes", "8MiB"}, {"taskbar-progress", "no"}};
     for (auto& kv : o) p_mpv_set_option_string(h, kv[0], kv[1]);
     if (o_slang[0]) p_mpv_set_option_string(h, "slang", U8(o_slang).c_str());
@@ -1884,9 +2121,15 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     p_mpv_observe_property(h, 0, "fullscreen", MPV_FORMAT_FLAG);
     p_mpv_observe_property(h, 0, "duration", MPV_FORMAT_DOUBLE);
     p_mpv_observe_property(h, 0, "time-pos", MPV_FORMAT_DOUBLE);
+    p_mpv_observe_property(h, 0, "osd-width", MPV_FORMAT_INT64);
+    p_mpv_observe_property(h, 0, "osd-height", MPV_FORMAT_INT64);
     if (o_preload) {
         g_preEv = CreateEventW(0, FALSE, FALSE, 0);
         CreateThread(0, 0, preloadThread, 0, 0, 0);
+    }
+    if (o_predec) {
+        g_ccEv = CreateEventW(0, FALSE, FALSE, 0);
+        CreateThread(0, 0, ccWorker, 0, 0, 0);
     }
     openIdx(idx);
     SetTimer(g_mw, 1, 200, 0);
